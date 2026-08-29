@@ -14,7 +14,7 @@ automated test suite.
 from __future__ import annotations
 
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from multilink_manager.models.enums import InterfaceStatus, InterfaceType
 from multilink_manager.models.interface import InterfaceInfo
@@ -163,7 +163,30 @@ class SteeringController:
         interfaces: List[InterfaceInfo],
         scores: Dict[str, ScoreResult],
         active_interface: Optional[str],
+        enabled_names: Optional[Set[str]] = None,
     ) -> SteeringStatus:
+        """Run one decision cycle.
+
+        ``interfaces`` should be *every* currently discovered interface
+        (not pre-filtered), so the VPN/Other no-bypass guard below can
+        still correctly recognize the currently active OS-observed path
+        even if it happens to be a deselected/disabled-in-app interface
+        (e.g. a VPN adapter that defaults to app-disabled but is still the
+        real active Windows route) -- and so ``_compute_target_metric``
+        keeps planning target metrics against every real competing
+        physical default route, never just the ones currently enabled in
+        this application's monitoring UI.
+
+        ``enabled_names``, if given, restricts which interfaces are ever
+        considered as switch *candidates* -- an interface whose name is
+        not in this set can never become ``target_interface``, no matter
+        how good its score. Pass ``None`` (default) to allow every
+        interface as a candidate (used by tests and any caller with no
+        interface-selection concept). This satisfies "steering never
+        selects a deselected path" without weakening the VPN/Other guard
+        or the target-metric planning above, both of which must still see
+        the full interface set.
+        """
         if not self.enabled:
             return self.status
 
@@ -206,6 +229,13 @@ class SteeringController:
 
         candidates: Dict[str, CandidateHealth] = {}
         for iface in interfaces:
+            if enabled_names is not None and iface.name not in enabled_names:
+                # Deselected in the GUI's Interfaces tab: never a switch
+                # candidate. Deliberately skipped *before* building a
+                # CandidateHealth entry at all (rather than building one
+                # and marking it ineligible) so it is indistinguishable
+                # from an interface the policy never knew existed.
+                continue
             score_result = scores.get(iface.name)
             score = score_result.score if score_result else None
             reachable = score_result.reachable if score_result else None

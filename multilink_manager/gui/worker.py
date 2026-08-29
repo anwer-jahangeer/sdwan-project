@@ -34,6 +34,10 @@ from multilink_manager.monitoring.distribution import (
     compute_distribution,
     compute_distribution_by_type,
 )
+from multilink_manager.monitoring.selection import (
+    InterfaceSelectionManager,
+    filter_connections_for_display,
+)
 from multilink_manager.networking.interfaces import (
     discover_interfaces,
     get_preferred_ipv4_interface_name,
@@ -62,6 +66,18 @@ class Snapshot:
     primary_target: Dict[str, Optional[str]] = field(default_factory=dict)
     preferred_interface: Optional[str] = None
     steering_status: Optional[SteeringStatus] = None
+    # Interface-selection additions: ``interfaces`` above always holds
+    # *every* discovered interface (so the Interfaces tab can list all of
+    # them, including disabled ones, for re-enabling). ``enabled_map``
+    # resolves every one of those names to its current enabled/disabled
+    # state (explicit override or type-based default -- see
+    # ``monitoring/selection.py``). ``enabled_interfaces`` is the filtered
+    # subset actually used for link health / traffic charts, matching what
+    # ``rates``/``counter_samples``/``distribution``/``type_distribution``/
+    # ``probes``/``connections``/``scores`` above already reflect (all of
+    # those are pre-filtered to enabled interfaces only).
+    enabled_map: Dict[str, bool] = field(default_factory=dict)
+    enabled_interfaces: List[InterfaceInfo] = field(default_factory=list)
 
 
 def diff_interface_names(
@@ -114,6 +130,7 @@ class MonitorWorker(QThread):
         interval_s: float = 2.0,
         probe_interval_s: float = 5.0,
         public_target: str = DEFAULT_PUBLIC_TARGET,
+        selection_manager: Optional[InterfaceSelectionManager] = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -121,7 +138,19 @@ class MonitorWorker(QThread):
         self.history_store = history_store
         self._counter_monitor = CounterMonitor()
         self._stop_event = threading.Event()
+        # ``_latest_all_interfaces`` holds every discovered interface (used
+        # by the GUI's Interfaces tab and by the steering VPN/Other guard
+        # and target-metric planning, which must see every real competing
+        # interface regardless of app-level selection). ``_latest_interfaces``
+        # (the ``LinkProber`` provider's return value) is the *enabled-only*
+        # subset, so probing itself never touches a deselected interface.
+        self._latest_all_interfaces: List[InterfaceInfo] = []
         self._latest_interfaces: List[InterfaceInfo] = []
+        # Owned by the GUI (MainWindow) and injected here so explicit
+        # user overrides survive across separate Start/Stop sessions, not
+        # just this one worker's lifetime. A fresh manager (all defaults)
+        # is created if none is supplied, e.g. for tests/standalone use.
+        self._selection = selection_manager or InterfaceSelectionManager()
         self._prober = LinkProber(
             self._get_latest_interfaces,
             interval_s=probe_interval_s,
@@ -141,6 +170,14 @@ class MonitorWorker(QThread):
         self._pending_steering_request: Optional[Tuple[str, Optional[SteeringConfig]]] = None
 
     def _get_latest_interfaces(self) -> List[InterfaceInfo]:
+        """``LinkProber``'s interfaces provider -- deliberately returns
+        only currently-*enabled* interfaces, so a deselected interface is
+        never probed. When an interface is deselected, it simply stops
+        appearing here; ``LinkProber._tick`` already prunes stale results
+        for any interface that stops appearing in its provider's list
+        (see ``tests/test_link_prober_stale.py``), so this reuses that
+        exact same mechanism for deselection with no further code needed.
+        """
         return self._latest_interfaces
 
     def set_interval(self, interval_s: float) -> None:
@@ -232,15 +269,51 @@ class MonitorWorker(QThread):
         interfaces = discover_interfaces()
         current_by_name = {i.name: i for i in interfaces}
         self._log_interface_changes(current_by_name)
-        self._latest_interfaces = interfaces
+        self._latest_all_interfaces = interfaces
+
+        # Resolve which interfaces are currently enabled for monitoring
+        # (explicit user override, else Ethernet/Wi-Fi-enabled-by-type
+        # default -- see monitoring/selection.py). Deselected interfaces
+        # remain fully visible in the Interfaces tab (via
+        # Snapshot.interfaces/enabled_map below) but are excluded from
+        # everything else: probing, live traffic/distribution/history,
+        # link health, and steering candidates.
+        enabled_map = self._selection.resolve(interfaces)
+        enabled_interfaces = [i for i in interfaces if enabled_map.get(i.name, False)]
+        enabled_names = {i.name for i in enabled_interfaces}
+        # LinkProber's provider (``_get_latest_interfaces``) reads this on
+        # its own independent cadence/thread; updating it here (rather
+        # than filtering inside the provider) keeps the provider itself a
+        # trivial, allocation-free accessor.
+        self._latest_interfaces = enabled_interfaces
+
         preferred = get_preferred_ipv4_interface_name()
 
+        # CounterMonitor is updated with samples for *every* discovered
+        # interface (not just enabled ones) so its delta baseline for a
+        # deselected interface is never lost -- if the interface is later
+        # re-enabled, the very next tick already has a valid previous
+        # sample instead of spuriously reporting "first sample" again.
         samples = read_counter_samples()
-        rates = self._counter_monitor.update(samples)
+        rates_all = self._counter_monitor.update(samples)
+
+        # Everything emitted on the Snapshot below (other than the
+        # Interfaces-tab fields) is filtered to enabled interfaces only.
+        rates = {name: r for name, r in rates_all.items() if name in enabled_names}
+        counter_samples = {name: s for name, s in samples.items() if name in enabled_names}
         distribution = compute_distribution(rates.values())
-        type_distribution = compute_distribution_by_type(rates.values(), interfaces)
-        connections = list_connections(interfaces)
-        probes = self._prober.get_results()
+        type_distribution = compute_distribution_by_type(rates.values(), enabled_interfaces)
+
+        # Attribute connections against *every* discovered interface (so a
+        # connection bound to a deselected interface's IP is still
+        # correctly identified as belonging to it, rather than becoming
+        # spuriously "unattributed"), then drop any connection attributed
+        # to a currently-deselected interface. Unattributed connections
+        # (interface_name is None) always remain shown.
+        connections_all = list_connections(interfaces)
+        connections = filter_connections_for_display(connections_all, enabled_names)
+
+        probes = self._prober.get_results()  # already limited to enabled interfaces (provider above)
 
         now = time.time()
         scores: Dict[str, ScoreResult] = {}
@@ -249,7 +322,7 @@ class MonitorWorker(QThread):
         reachability_now: Dict[str, Optional[bool]] = {}
         history_records = []
 
-        for iface in interfaces:
+        for iface in enabled_interfaces:
             name = iface.name
             rate = rates.get(name)
             iface_probes = probes.get(name, {})
@@ -316,13 +389,20 @@ class MonitorWorker(QThread):
         if history_records:
             self.history_store.add_many(history_records)
 
-        steering_status = self._steering.tick(interfaces, scores, active_interface=preferred)
+        # Pass the FULL interface list (not just enabled_interfaces) so the
+        # VPN/Other no-bypass guard and target-metric planning inside
+        # SteeringController.tick() still see every real competing
+        # interface; enabled_names alone restricts which interfaces can
+        # ever become a switch *candidate*.
+        steering_status = self._steering.tick(
+            interfaces, scores, active_interface=preferred, enabled_names=enabled_names,
+        )
 
         snapshot = Snapshot(
             timestamp=now,
             interfaces=interfaces,
             rates=rates,
-            counter_samples=samples,
+            counter_samples=counter_samples,
             distribution=distribution,
             type_distribution=type_distribution,
             connections=connections,
@@ -332,5 +412,7 @@ class MonitorWorker(QThread):
             primary_target=primary_target,
             preferred_interface=preferred,
             steering_status=steering_status,
+            enabled_map=enabled_map,
+            enabled_interfaces=enabled_interfaces,
         )
         self.snapshot_ready.emit(snapshot)

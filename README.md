@@ -42,13 +42,14 @@ full algorithm, safety model, and limitations before enabling it.
 1. [Architecture](#architecture)
 2. [Installation](#installation)
 3. [Running the application](#running-the-application)
-4. [Metric source / method / accuracy](#metric-source--method--accuracy)
-5. [Scoring formula](#scoring-formula)
-6. [Manual verification procedures (8 scenarios)](#manual-verification-procedures)
-7. [Automatic failover (opt-in)](#automatic-failover-opt-in)
-8. [Supported vs. unsupported metrics](#supported-vs-unsupported-metrics)
-9. [Known limitations](#known-limitations)
-10. [Recommended future architecture](#recommended-future-architecture)
+4. [Windows executable (prebuilt build)](#windows-executable-prebuilt-build)
+5. [Metric source / method / accuracy](#metric-source--method--accuracy)
+6. [Scoring formula](#scoring-formula)
+7. [Manual verification procedures (8 scenarios)](#manual-verification-procedures)
+8. [Automatic failover (opt-in)](#automatic-failover-opt-in)
+9. [Supported vs. unsupported metrics](#supported-vs-unsupported-metrics)
+10. [Known limitations](#known-limitations)
+11. [Recommended future architecture](#recommended-future-architecture)
 
 ---
 
@@ -76,6 +77,8 @@ multilink_manager/
     counters.py            Cumulative counters -> delta rates (Mbps/pps)
     distribution.py         RX/TX/combined percentage distribution
     connections.py           psutil.net_connections() -> ConnectionInfo (no bytes)
+    selection.py              Per-interface monitoring enable/disable (app-level
+                               only -- never touches the OS adapter/routes)
   scoring/
     scorer.py                Documented 0-100 link quality formula
   steering/                Opt-in automatic active/backup failover (OFF by default)
@@ -96,18 +99,21 @@ multilink_manager/
 **Data flow per tick** (default every 2s, configurable):
 
 ```
-discover_interfaces()          -> InterfaceInfo[]           (networking/interfaces.py)
-get_preferred_ipv4_interface_name() -> str|None             (effective metric = RouteMetric + InterfaceMetric, lowest wins)
-read_counter_samples()          -> CounterSample{}          (monitoring/counters.py; also kept on Snapshot.counter_samples)
-CounterMonitor.update()          -> RateSample{}             (delta vs previous sample)
-compute_distribution()           -> DistributionEntry{}      (monitoring/distribution.py; RX/TX/combined)
-compute_distribution_by_type()   -> DistributionEntry{}      (monitoring/distribution.py; grouped by Ethernet/Wi-Fi/Other, Snapshot.type_distribution)
-list_connections()               -> ConnectionInfo[]         (monitoring/connections.py)
-LinkProber.get_results()         -> ProbeResult{iface:{gateway,public}}  (independent background cadence, stale entries pruned)
-compute_score() per target       -> ScoreResult              (scoring/scorer.py; Snapshot.target_scores["iface"]["gateway"|"public"])
+discover_interfaces()          -> InterfaceInfo[]           (networking/interfaces.py; EVERY discovered interface)
+InterfaceSelectionManager.resolve() -> {name: enabled}       (monitoring/selection.py; override or Ethernet/Wi-Fi-by-type default)
+                                                              filter to enabled-only for everything below except
+                                                              the Interfaces tab, which always lists every interface
+get_preferred_ipv4_interface_name() -> str|None             (effective metric = RouteMetric + InterfaceMetric, lowest wins; NOT filtered by selection -- always the real OS-observed path)
+read_counter_samples()          -> CounterSample{}          (monitoring/counters.py; read for EVERY interface, for baseline continuity)
+CounterMonitor.update()          -> RateSample{}             (delta vs previous sample, computed for every interface; emitted/Snapshot fields below are filtered to enabled interfaces only)
+compute_distribution()           -> DistributionEntry{}      (monitoring/distribution.py; RX/TX/combined, enabled interfaces only)
+compute_distribution_by_type()   -> DistributionEntry{}      (monitoring/distribution.py; grouped by Ethernet/Wi-Fi/Other, Snapshot.type_distribution, enabled interfaces only)
+list_connections()               -> ConnectionInfo[]         (monitoring/connections.py; attributed against every interface, then filtered -- unattributed connections always kept)
+LinkProber.get_results()         -> ProbeResult{iface:{gateway,public}}  (independent background cadence; provider returns enabled interfaces only, stale entries pruned immediately on disappearance OR deselection)
+compute_score() per target       -> ScoreResult              (scoring/scorer.py; Snapshot.target_scores["iface"]["gateway"|"public"], enabled interfaces only)
 choose primary_target per iface  -> "public" if scored, else "gateway" fallback (Snapshot.primary_target; used for HistoryRecord/history + Link Health "(primary)" label)
-HistoryStore.add_many()          -> retained for the configured time window, using each interface's primary_target score/RTT/loss/jitter
-SteeringController.tick()        -> SteeringStatus            (steering/controller.py; no-op unless explicitly enabled, see below; carried as Snapshot.steering_status)
+HistoryStore.add_many()          -> retained for the configured time window, using each interface's primary_target score/RTT/loss/jitter (enabled interfaces only)
+SteeringController.tick()        -> SteeringStatus            (steering/controller.py; no-op unless explicitly enabled; sees every interface for the VPN/Other guard and target-metric planning, but enabled_names restricts which interfaces can ever become a switch candidate; carried as Snapshot.steering_status)
 Snapshot                         -> emitted via Qt signal to MainWindow for rendering
 ```
 
@@ -148,6 +154,24 @@ setters (no I/O), which are processed at the very start of the next tick.
 the app, which calls `stop_monitoring()` - always restores any changed
 setting before the worker thread exits, even if the user forgot to click
 Disable first.
+
+**Interface selection (enable/disable per adapter for monitoring only)**
+is a separate, purely in-application concept from all of the above and
+from the opt-in steering feature - it never issues any OS command at all.
+`InterfaceSelectionManager` (`monitoring/selection.py`) is owned by
+`MainWindow` (so overrides survive across separate Start/Stop sessions,
+not just one `MonitorWorker`'s lifetime) and injected into each
+`MonitorWorker` at construction. Toggling the **Enabled** checkbox in the
+Interfaces tab calls `set_override(name, enabled)` directly from the GUI
+thread; this is safe without deferring to the next tick (unlike steering
+enable/disable) because it only ever guards a plain dict with a
+`threading.Lock` - no PowerShell/ping/adapter command is ever involved.
+`MonitorWorker` resolves the current enabled/disabled state once per tick
+(explicit override, else Ethernet/Wi-Fi-by-type default) and filters
+probing, live traffic/distribution/history, link health, and steering
+candidates to enabled interfaces only; the Interfaces tab itself always
+lists every discovered interface (enabled or not) so a deselected adapter
+can be re-enabled at any time.
 
 ---
 
@@ -221,13 +245,19 @@ Tabs:
   Windows currently prefers for the default IPv4 route computed from each
   interface's *effective* route metric (`RouteMetric + InterfaceMetric`,
   lowest wins - not `RouteMetric` alone), shown for information only; this
-  application never switches or reorders routes. (2) **RX/TX/Combined
-  traffic distribution**, current-tick percentage bars per interface. (3)
-  **Link Health**, one row per interface **per target** (gateway and
-  public each get their own row with their own RTT/loss/jitter/
-  reachability/score); the row whose score is used for history/scoring
-  purposes is labelled `(primary)` - public-preferred, falling back to
-  gateway only when the public probe itself has no usable result.
+  application never switches or reorders routes. If the currently
+  Windows-preferred interface has been deselected in the Interfaces tab
+  (see below), the label still shows the true OS-observed path but appends
+  a clear `[DESELECTED - excluded from monitoring/steering]` note - the
+  app never hides or misrepresents Windows' actual routing decision, it
+  only clarifies that this app is not currently tracking that interface.
+  (2) **RX/TX/Combined traffic distribution**, current-tick percentage
+  bars per interface. (3) **Link Health**, one row per interface **per
+  target** (gateway and public each get their own row with their own
+  RTT/loss/jitter/ reachability/score); the row whose score is used for
+  history/scoring purposes is labelled `(primary)` - public-preferred,
+  falling back to gateway only when the public probe itself has no usable
+  result. Deselected interfaces never appear in Link Health.
 - **Live Traffic** - an explicit per-interface counters table (cumulative
   RX/TX bytes, cumulative RX/TX packets, cumulative RX/TX errors and
   discards, current RX/TX/Total Mbps, RX/TX pps - 14 columns), plus seven
@@ -238,7 +268,17 @@ Tabs:
   time window and are all cleared together by **Clear History**.
 - **Interfaces** - full interface metadata table (type, classification
   source, status, addresses, MAC, negotiated link speed, network profile,
-  gateways).
+  gateways) for **every** discovered interface, plus a leading
+  **Enabled** checkbox column controlling whether that interface is
+  included in monitoring (see "Interface selection" below). This tab
+  always lists every discovered interface regardless of its enabled
+  state, so a deselected adapter remains visible and can be re-enabled at
+  any time. Two buttons above the table: **Select physical defaults**
+  resets every interface back to its type-based default (checked for
+  Ethernet/Wi-Fi, unchecked for Other/Unknown/virtual/VPN/loopback -
+  classification is never based on adapter name); **Deselect all**
+  unchecks every interface. Toggling a checkbox takes effect on the next
+  tick without needing to Stop/Start.
 - **Applications / Connections** - process/PID/endpoint/protocol/state per
   connection, with interface attribution and an explicit "unavailable"
   byte-counter column.
@@ -247,6 +287,99 @@ Tabs:
   failover. See [Automatic failover (opt-in)](#automatic-failover-opt-in)
   below for the full algorithm, safety model, and required confirmation
   steps before using it.
+
+### Interface selection (per-adapter monitoring enable/disable)
+
+Every discovered interface can be independently included in or excluded
+from monitoring via the **Enabled** checkbox on the Interfaces tab. This
+is a purely app-level, in-memory concept - it never issues any OS
+command, never changes routes/metrics, and never disconnects/reconfigures
+an adapter; a deselected interface's OS state is completely untouched.
+
+- **Defaults** (no explicit override yet): enabled for interfaces
+  classified `ETHERNET` or `WIFI`; disabled for `OTHER`/`UNKNOWN` (this is
+  where virtual adapters, VPN clients, and loopback/pseudo-interfaces end
+  up, since classification is by Windows media-type metadata, never by
+  adapter name). A newly appearing physical Ethernet/Wi-Fi adapter is
+  enabled by default; a newly appearing `Other` adapter is disabled by
+  default.
+- **Explicit overrides** always win over the type-based default and are
+  keyed by interface **name**, so your choice is remembered for the
+  current app session even if that adapter temporarily disappears and
+  later reappears (e.g. unplug/replug a USB NIC, or a VPN client
+  reconnecting under the same adapter name).
+- **What gets excluded** when an interface is deselected: link probing
+  (gateway/public RTT/loss/jitter/reachability), the Live Traffic
+  counters table and all seven history charts, the RX/TX/combined
+  distribution (both current-tick bars and the percentage-over-time
+  chart), history retained for CSV export, Link Health rows on the
+  Dashboard, and eligibility as an automatic-steering switch candidate.
+  Connections/applications whose local IP address exactly matches a
+  deselected interface are hidden from the Applications/Connections tab;
+  connections that cannot be attributed to any interface at all
+  (`laddr` unknown/loopback/wildcard) remain shown regardless, since they
+  were never attributed to the deselected interface in the first place.
+- **What is never hidden**: the Interfaces tab itself always lists every
+  discovered interface so it can be re-enabled later, and the Dashboard's
+  "Current path" always reports Windows' real, currently-preferred
+  interface even if that interface happens to be deselected (annotated
+  with a `[DESELECTED]` note rather than substituted or hidden) - this
+  app never misrepresents what Windows itself is actually doing.
+- **Steering safety**: a deselected interface can never be chosen as an
+  automatic-failover switch target, regardless of its score, because the
+  candidate-building step is filtered by the same enabled set used
+  everywhere else.
+
+---
+
+## Windows executable (prebuilt build)
+
+A one-file, windowed Windows executable (`MultiLinkManager.exe`) can be
+built with [PyInstaller](https://pyinstaller.org/) and is automatically
+built and tested by CI (see `.github/workflows/windows-build.yml`) on
+every push/PR touching the app and on manual `workflow_dispatch` runs.
+
+### Download and run (from a CI artifact)
+
+1. Open the workflow run's **Actions** tab on GitHub, select the latest
+   successful **Windows Build** run, and download the
+   `MultiLinkManager-windows-exe` artifact (a zip containing
+   `MultiLinkManager.exe`). Artifacts are retained for 14 days.
+2. Unzip anywhere and double-click `MultiLinkManager.exe` - no installer,
+   no admin prompt, no registry writes. It is a portable, single-file
+   app: PyInstaller's one-file mode extracts its bundled Python runtime to
+   a private temp folder on each launch and cleans it up on exit.
+3. **Windows SmartScreen / "unknown publisher" warning**: because this
+   build is not code-signed, Windows may show *"Windows protected your
+   PC"* on first run. This is expected for any unsigned, freshly-built
+   executable - click **More info -> Run anyway** to proceed. There is no
+   way to avoid this warning without a paid code-signing certificate,
+   which is out of scope for this MVP.
+4. **Administrator privileges are only needed for steering.** Running and
+   using the app normally - monitoring, link health, traffic, interface
+   selection - all work fine as a standard (non-elevated) user, exactly
+   as when running from source. Only clicking **Enable automatic
+   steering** on the Steering tab requires (and checks for) an elevated
+   session; the app itself never requests or forces elevation at launch.
+
+### Building locally
+
+```powershell
+pip install -r requirements.txt -r requirements-build.txt
+pyinstaller packaging\MultiLinkManager.spec --noconfirm
+# Output: dist\MultiLinkManager.exe
+```
+
+`requirements-build.txt` adds only PyInstaller on top of the app's normal
+runtime requirements, so a plain `pip install -r requirements.txt` (used
+to run the app or the test suite) never pulls in PyInstaller. The spec
+(`packaging/MultiLinkManager.spec`) builds from the thin entry-point
+wrapper `run_multilink_manager.py` (needed because PyInstaller's static
+analysis wants a plain script, not a `python -m package` invocation), sets
+`console=False` for a windowed app, and does **not** request or embed any
+elevation manifest - launching the EXE never triggers a UAC prompt;
+elevation is only ever required interactively at the in-app "Enable
+automatic steering" click, exactly as when running from source.
 
 ---
 
@@ -463,6 +596,40 @@ each scenario. Within each scenario, check whatever tabs are called out.
      but they must not diverge wildly or go backwards tick over tick
      except across a genuine counter reset, which the app detects and
      treats as a fresh baseline rather than a negative delta).
+
+### Manual test procedure: interface selection (enable/disable per adapter)
+
+Not one of the 8 required scenarios above, but included here since it
+directly relates to the v0.2-style interface-selection feature added on
+top of them:
+
+1. If you have a VPN client, virtual adapter, or other non-Ethernet/Wi-Fi
+   interface, connect it (or otherwise ensure at least one `Other`-
+   classified interface is present) alongside a physical Ethernet or
+   Wi-Fi adapter, then Start monitoring.
+2. **Interfaces** tab: confirm the physical Ethernet/Wi-Fi adapter(s) show
+   the **Enabled** checkbox checked by default, and the VPN/virtual/Other
+   adapter shows it **unchecked** by default - with no adapter-name-based
+   logic involved (classification is by Windows media-type metadata).
+3. Uncheck the physical adapter's **Enabled** box. Within one tick,
+   confirm it disappears from **Dashboard** Link Health, from the **Live
+   Traffic** counters table and all seven history charts, and from the
+   RX/TX/Combined distribution bars - while it remains visible (still
+   listed, just unchecked) on the **Interfaces** tab itself.
+4. Re-check the box. Confirm the interface reappears in Link Health/Live
+   Traffic/distribution within one tick, and that its counters resume
+   from a sane baseline (no artificial traffic spike from the gap).
+5. Click **Select physical defaults**. Confirm every Ethernet/Wi-Fi
+   adapter becomes checked and every Other/Unknown adapter becomes
+   unchecked, regardless of any manual overrides made in steps 3-4.
+6. Click **Deselect all**. Confirm every adapter becomes unchecked and
+   Link Health / Live Traffic / distribution go empty for all interfaces,
+   while the Interfaces tab itself still lists all of them.
+7. If Steering is enabled, confirm a deselected interface never appears
+   as a switch candidate/target even if it would otherwise score higher
+   than the active path (covered automatically by
+   `tests/test_steering_controller.py::test_deselected_interface_never_becomes_steering_candidate`,
+   but may be manually cross-checked via the Steering tab's decision log).
 
 ---
 
@@ -844,6 +1011,20 @@ above.)*
   widget re-paints the full visible window each tick; it is adequate for a
   handful of interfaces at multi-second cadences but is not optimized for
   very high-frequency updates or many dozens of series.
+- **Interface selection is app-level filtering, not adapter control.**
+  Deselecting an interface only stops this app from probing/graphing/
+  scoring it and from considering it as a steering candidate - it does
+  **not** disable, disconnect, or reconfigure the adapter in Windows in
+  any way, and the OS continues to route traffic through it exactly as
+  before. A deselected interface can still be the OS's actual preferred
+  default route, which the Dashboard clearly annotates rather than hides.
+  Overrides are session-scoped (in-memory, tied to the running
+  `InterfaceSelectionManager` instance) and are not currently persisted
+  across an app restart.
+- **The prebuilt Windows `.exe` is unsigned.** It will trigger a Windows
+  SmartScreen "unknown publisher" warning on first run (see "Windows
+  executable (prebuilt build)" above); there is no code-signing
+  certificate applied in this MVP's CI build.
 
 ## Recommended future architecture
 

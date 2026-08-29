@@ -519,3 +519,53 @@ def test_reenable_refused_when_previous_restore_left_settings_modified(monkeypat
     assert controller.status.last_error is not None
     assert "wifi0" in controller.status.last_error
     assert controller._saved_settings == {"wifi0": wifi0_original}
+
+
+def test_deselected_interface_never_becomes_steering_candidate(monkeypatch):
+    """A deselected (app-level, not OS-level) interface must never be
+    selected as a switch target, no matter how much better its score is,
+    when its name is excluded from ``enabled_names``."""
+    fake = FakeRouteController()
+    fake.default_routes = {1: True, 2: True}
+    fake.ip_settings = {2: OriginalInterfaceSetting("wifi0", 2, True, 35)}
+    fake.verify_after_apply = "wifi0"
+
+    config = SteeringConfig(min_consecutive_cycles=1, score_advantage_threshold=10.0)
+    controller = _enable(fake, config, monkeypatch)
+
+    interfaces = [_iface("eth0", 1), _iface("wifi0", 2)]
+    scores = {
+        "eth0": _score("eth0", 10.0, reachable=False),  # confirmed unhealthy
+        "wifi0": _score("wifi0", 95.0, reachable=True),  # would otherwise clearly win
+    }
+    # wifi0 is deselected in the GUI -- never a candidate even though it
+    # is the only healthy, reachable, high-scoring option.
+    status = controller.tick(
+        interfaces, scores, active_interface="eth0", enabled_names={"eth0"},
+    )
+
+    assert status.target_interface is None
+    assert not fake.applied_calls
+    assert "no eligible" in status.last_decision_reason
+
+
+def test_enabled_names_none_allows_every_interface_as_candidate(monkeypatch):
+    """Passing enabled_names=None (the default) must behave exactly as
+    before this feature existed -- every interface remains a candidate."""
+    fake = FakeRouteController()
+    fake.default_routes = {1: True, 2: True}
+    fake.ip_settings = {2: OriginalInterfaceSetting("wifi0", 2, True, 35)}
+    fake.verify_after_apply = "wifi0"
+
+    config = SteeringConfig(min_consecutive_cycles=1, score_advantage_threshold=10.0)
+    controller = _enable(fake, config, monkeypatch)
+
+    interfaces = [_iface("eth0", 1), _iface("wifi0", 2)]
+    scores = {
+        "eth0": _score("eth0", 10.0, reachable=False),
+        "wifi0": _score("wifi0", 95.0, reachable=True),
+    }
+    status = controller.tick(interfaces, scores, active_interface="eth0")
+
+    assert status.target_interface == "wifi0"
+    assert fake.applied_calls

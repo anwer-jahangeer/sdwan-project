@@ -1,0 +1,79 @@
+name: Windows Build
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "multilink_manager/**"
+      - "run_multilink_manager.py"
+      - "packaging/**"
+      - "requirements.txt"
+      - "requirements-build.txt"
+      - ".github/workflows/windows-build.yml"
+  pull_request:
+    paths:
+      - "multilink_manager/**"
+      - "run_multilink_manager.py"
+      - "packaging/**"
+      - "requirements.txt"
+      - "requirements-build.txt"
+      - ".github/workflows/windows-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-build:
+    name: Test and build Windows EXE
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run pytest
+        run: python -m pytest multilink_manager\tests -q --junitxml=pytest-results.xml
+
+      - name: Byte-compile check (compileall)
+        run: python -m compileall -q multilink_manager run_multilink_manager.py
+
+      - name: Install PyInstaller (build-only dependency)
+        run: pip install -r requirements-build.txt
+
+      - name: Build one-file windowed EXE with PyInstaller
+        run: pyinstaller packaging\MultiLinkManager.spec --noconfirm
+
+      - name: Upload MultiLinkManager.exe artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MultiLinkManager-windows-exe
+          path: dist/MultiLinkManager.exe
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build-test-results
+          path: pytest-results.xml
+          if-no-files-found: warn
+          retention-days: 14

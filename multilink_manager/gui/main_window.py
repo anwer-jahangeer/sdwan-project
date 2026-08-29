@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
 
 from multilink_manager.gui.charts import TimeSeriesChart
 from multilink_manager.gui.worker import MonitorWorker, Snapshot
+from multilink_manager.monitoring.selection import InterfaceSelectionManager
 from multilink_manager.models.steering import (
     DEFAULT_HOLD_DOWN_SECONDS,
     DEFAULT_MIN_CONSECUTIVE_CYCLES,
@@ -131,12 +132,17 @@ class MainWindow(QMainWindow):
         parent=None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("MultiLink Manager - MVP v0.1 (read-only)")
+        self.setWindowTitle("MultiLink Manager - Monitoring + Opt-in Failover")
         self.resize(1280, 860)
 
         self.history_store = HistoryStore(retention_minutes=initial_retention_minutes)
         self.worker: Optional[MonitorWorker] = None
         self._latest_snapshot: Optional[Snapshot] = None
+        # Owned by the GUI so explicit per-interface enable/disable
+        # overrides survive across separate Start/Stop sessions (not just
+        # one MonitorWorker's lifetime); injected into each MonitorWorker
+        # at construction time (see start_monitoring).
+        self._selection = InterfaceSelectionManager()
 
         self._build_ui(initial_interval_s, initial_retention_minutes, initial_public_target)
 
@@ -215,6 +221,7 @@ class MainWindow(QMainWindow):
         path_box = QGroupBox("Current path (observed preferred/default IPv4 route -- never switched by this app)")
         path_layout = QVBoxLayout(path_box)
         self.current_path_label = QLabel("Preferred interface: unknown")
+        self.current_path_label.setWordWrap(True)
         path_layout.addWidget(self.current_path_label)
         layout.addWidget(path_box)
 
@@ -302,19 +309,50 @@ class MainWindow(QMainWindow):
     def _build_interfaces_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        self.interfaces_table = QTableWidget(0, 12)
+
+        btn_layout = QHBoxLayout()
+        self.select_physical_defaults_btn = QPushButton("Select physical defaults")
+        self.select_physical_defaults_btn.setToolTip(
+            "Reset every listed interface's selection to the type-based default: "
+            "Ethernet/Wi-Fi enabled, everything else (Other/Unknown/virtual/VPN/"
+            "loopback) disabled."
+        )
+        self.select_physical_defaults_btn.clicked.connect(self._on_select_physical_defaults_clicked)
+        self.deselect_all_btn = QPushButton("Deselect all")
+        self.deselect_all_btn.setToolTip(
+            "Disable every listed interface for monitoring (they remain listed here "
+            "so you can re-enable any of them)."
+        )
+        self.deselect_all_btn.clicked.connect(self._on_deselect_all_clicked)
+        btn_layout.addWidget(self.select_physical_defaults_btn)
+        btn_layout.addWidget(self.deselect_all_btn)
+        btn_layout.addStretch(1)
+        layout.addLayout(btn_layout)
+
+        self.interfaces_table = QTableWidget(0, 13)
         self.interfaces_table.setHorizontalHeaderLabels([
-            "Name", "Friendly Name", "Index", "Type", "Status",
+            "Enabled", "Name", "Friendly Name", "Index", "Type", "Status",
             "IPv4", "IPv6", "IPv4 Gateway", "IPv6 Gateway",
             "MAC", "Link Speed (Mbps)", "Network Profile",
         ])
         self.interfaces_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        # Every cell except the "Enabled" checkbox stays fully read-only;
+        # NoEditTriggers only blocks text editing, not clicking a
+        # checkable item's indicator, so the checkbox remains interactive.
         self.interfaces_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.interfaces_table.itemChanged.connect(self._on_interface_item_changed)
         layout.addWidget(self.interfaces_table)
 
         note = QLabel(
             "Classification is derived from interface type / Windows adapter metadata "
-            "(never hardcoded by display name). See README for classification_source detail."
+            "(never hardcoded by display name). Ethernet/Wi-Fi interfaces are enabled by "
+            "default; Other/Unknown/virtual/VPN/loopback interfaces are disabled by "
+            "default. Toggle 'Enabled' to control whether an interface is included in "
+            "probing, live traffic/distribution/history, link health, and automatic "
+            "steering candidates -- this NEVER disables/disconnects the adapter itself or "
+            "touches Windows routing; deselected interfaces stay listed here so you can "
+            "re-enable them at any time, even while monitoring is running. See README for "
+            "classification_source detail."
         )
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -446,6 +484,7 @@ class MainWindow(QMainWindow):
             interval_s=self.interval_spin.value(),
             probe_interval_s=DEFAULT_PROBE_INTERVAL_S,
             public_target=public_target,
+            selection_manager=self._selection,
         )
         self.worker.snapshot_ready.connect(self._on_snapshot)
         self.worker.error_occurred.connect(self._on_worker_error)
@@ -582,9 +621,16 @@ class MainWindow(QMainWindow):
 
     def _render_current_path(self, snapshot: Snapshot) -> None:
         if snapshot.preferred_interface:
+            note = ""
+            if not snapshot.enabled_map.get(snapshot.preferred_interface, True):
+                note = (
+                    " [DESELECTED in Interfaces tab -- excluded from monitoring/steering/"
+                    "history; shown here only because Windows currently uses it as the "
+                    "observed preferred path]"
+                )
             self.current_path_label.setText(
                 f"Preferred interface (observed, effective-metric route selection): "
-                f"{snapshot.preferred_interface}"
+                f"{snapshot.preferred_interface}{note}"
             )
         else:
             self.current_path_label.setText(
@@ -610,7 +656,7 @@ class MainWindow(QMainWindow):
 
     def _render_link_health(self, snapshot: Snapshot) -> None:
         rows = []
-        for iface in snapshot.interfaces:
+        for iface in snapshot.enabled_interfaces:
             name = iface.name
             iface_probes = snapshot.probes.get(name, {})
             primary_type = snapshot.primary_target.get(name)
@@ -678,7 +724,7 @@ class MainWindow(QMainWindow):
         for type_name, entry in snapshot.type_distribution.items():
             self.type_distribution_chart.add_point(type_name, entry.combined_pct, ts)
 
-        for iface in snapshot.interfaces:
+        for iface in snapshot.enabled_interfaces:
             name = iface.name
             primary_type = snapshot.primary_target.get(name)
             probe = snapshot.probes.get(name, {}).get(primary_type) if primary_type else None
@@ -692,25 +738,66 @@ class MainWindow(QMainWindow):
                 self.score_chart.add_point(name, score.score, ts)
 
     def _render_interfaces(self, snapshot: Snapshot) -> None:
+        self._render_interfaces_table(snapshot.interfaces, snapshot.enabled_map)
+
+    def _render_interfaces_table(self, interfaces, enabled_map: Dict[str, bool]) -> None:
         table = self.interfaces_table
-        table.setRowCount(len(snapshot.interfaces))
-        for row, iface in enumerate(snapshot.interfaces):
-            values = [
-                iface.name,
-                iface.friendly_name,
-                _fmt(iface.index),
-                iface.if_type.value,
-                iface.status.value,
-                _fmt_list(iface.ipv4_addresses),
-                _fmt_list(iface.ipv6_addresses),
-                iface.ipv4_gateway or "unavailable",
-                iface.ipv6_gateway or "unavailable",
-                iface.mac_address or "unavailable",
-                _fmt(iface.link_speed_mbps),
-                iface.network_profile or "unavailable",
-            ]
-            for col, value in enumerate(values):
-                table.setItem(row, col, QTableWidgetItem(value))
+        # Block signals for the entire programmatic rebuild so setting
+        # each checkbox's state below never re-enters
+        # ``_on_interface_item_changed`` via ``itemChanged`` -- that signal
+        # must only ever fire for a genuine user click on the checkbox.
+        table.blockSignals(True)
+        try:
+            table.setRowCount(len(interfaces))
+            for row, iface in enumerate(interfaces):
+                enabled = enabled_map.get(iface.name, False)
+                check_item = QTableWidgetItem()
+                check_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                check_item.setCheckState(Qt.Checked if enabled else Qt.Unchecked)
+                check_item.setData(Qt.UserRole, iface.name)
+                table.setItem(row, 0, check_item)
+                values = [
+                    iface.name,
+                    iface.friendly_name,
+                    _fmt(iface.index),
+                    iface.if_type.value,
+                    iface.status.value,
+                    _fmt_list(iface.ipv4_addresses),
+                    _fmt_list(iface.ipv6_addresses),
+                    iface.ipv4_gateway or "unavailable",
+                    iface.ipv6_gateway or "unavailable",
+                    iface.mac_address or "unavailable",
+                    _fmt(iface.link_speed_mbps),
+                    iface.network_profile or "unavailable",
+                ]
+                for col, value in enumerate(values, start=1):
+                    table.setItem(row, col, QTableWidgetItem(value))
+        finally:
+            table.blockSignals(False)
+
+    def _on_interface_item_changed(self, item) -> None:
+        if item.column() != 0:
+            return
+        name = item.data(Qt.UserRole)
+        if not name:
+            return
+        enabled = item.checkState() == Qt.Checked
+        self._selection.set_override(name, enabled)
+        logger.info("Interface '%s' %s by user (Interfaces tab)", name, "enabled" if enabled else "disabled")
+
+    def _on_select_physical_defaults_clicked(self) -> None:
+        interfaces = self._latest_snapshot.interfaces if self._latest_snapshot else []
+        self._selection.select_physical_defaults(interfaces)
+        self._render_interfaces_table(interfaces, self._selection.resolve(interfaces))
+        logger.info("Interface selection reset to physical defaults (Ethernet/Wi-Fi) from GUI")
+        self.status_label.setText("Interface selection reset to physical defaults (Ethernet/Wi-Fi enabled).")
+
+    def _on_deselect_all_clicked(self) -> None:
+        interfaces = self._latest_snapshot.interfaces if self._latest_snapshot else []
+        self._selection.deselect_all(interfaces)
+        self._render_interfaces_table(interfaces, self._selection.resolve(interfaces))
+        logger.info("All interfaces deselected from GUI")
+        self.status_label.setText("All interfaces deselected (still listed; re-enable any at any time).")
 
     def _render_connections(self, snapshot: Snapshot) -> None:
         table = self.connections_table

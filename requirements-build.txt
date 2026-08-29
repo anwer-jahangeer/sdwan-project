@@ -1,0 +1,18 @@
+# Extra dependencies needed only to *package* the app into a standalone
+# Windows .exe with PyInstaller -- NOT needed to run the app from source,
+# and NOT needed to run the test suite (pytest). Kept separate from
+# requirements.txt on purpose so a normal `pip install -r requirements.txt`
+# (used by the app itself and by CI's pytest step) never pulls in
+# PyInstaller.
+#
+# Install alongside requirements.txt only when you actually intend to
+# build the one-file executable locally:
+#
+#   pip install -r requirements.txt -r requirements-build.txt
+#   pyinstaller packaging\MultiLinkManager.spec --noconfirm
+#
+# See README "Windows executable (prebuilt build)" and
+# .github/workflows/windows-build.yml, which installs both files before
+# building the artifact on windows-latest.
+-r requirements.txt
+pyinstaller>=6.0
