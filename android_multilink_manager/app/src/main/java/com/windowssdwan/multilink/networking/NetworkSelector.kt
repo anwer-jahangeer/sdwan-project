@@ -39,7 +39,7 @@ interface NetworkSelector {
 class HysteresisNetworkSelector(
     private val networkMonitor: NetworkMonitor,
     private val scores: StateFlow<Map<LinkId, LinkScore>>,
-    scope: CoroutineScope,
+    private val scope: CoroutineScope,
     policyConfig: SelectionPolicyConfig = SelectionPolicyConfig()
 ) : NetworkSelector {
 
