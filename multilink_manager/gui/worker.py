@@ -42,7 +42,12 @@ from multilink_manager.networking.interfaces import (
     discover_interfaces,
     get_preferred_ipv4_interface_name,
 )
-from multilink_manager.networking.probing import DEFAULT_PUBLIC_TARGET, LinkProber
+from multilink_manager.networking.probing import (
+    DEFAULT_HTTPS_TARGETS,
+    DEFAULT_ICMP_TARGETS,
+    LinkProber,
+)
+from multilink_manager.scoring.aggregation import aggregate_internet_probes
 from multilink_manager.scoring.scorer import compute_score
 from multilink_manager.steering.controller import SteeringController
 from multilink_manager.storage.history_store import HistoryStore
@@ -129,7 +134,8 @@ class MonitorWorker(QThread):
         history_store: HistoryStore,
         interval_s: float = 2.0,
         probe_interval_s: float = 5.0,
-        public_target: str = DEFAULT_PUBLIC_TARGET,
+        icmp_targets: Optional[List[str]] = None,
+        https_targets: Optional[List[str]] = None,
         selection_manager: Optional[InterfaceSelectionManager] = None,
         parent=None,
     ) -> None:
@@ -154,7 +160,8 @@ class MonitorWorker(QThread):
         self._prober = LinkProber(
             self._get_latest_interfaces,
             interval_s=probe_interval_s,
-            public_target=public_target,
+            icmp_targets=icmp_targets if icmp_targets is not None else list(DEFAULT_ICMP_TARGETS),
+            https_targets=https_targets if https_targets is not None else list(DEFAULT_HTTPS_TARGETS),
         )
         # State tracked across ticks purely for change-detection logging.
         self._previous_interfaces_by_name: Dict[str, InterfaceInfo] = {}
@@ -220,7 +227,10 @@ class MonitorWorker(QThread):
             self._steering.disable()
 
     def run(self) -> None:  # noqa: D102 (Qt override)
-        logger.info("MonitorWorker starting (public_target=%s)", self._prober.public_target)
+        logger.info(
+            "MonitorWorker starting (icmp_targets=%s, https_targets=%s)",
+            self._prober.icmp_targets, self._prober.https_targets,
+        )
         self._prober.start()
         try:
             while not self._stop_event.is_set():
@@ -325,32 +335,49 @@ class MonitorWorker(QThread):
         for iface in enabled_interfaces:
             name = iface.name
             rate = rates.get(name)
-            iface_probes = probes.get(name, {})
+            iface_probes = dict(probes.get(name, {}))  # target_id -> ProbeResult (raw)
 
-            # Score every target row independently so Link Health can show
-            # a correct, target-specific score per row instead of reusing
-            # one interface-wide value on both the gateway and public rows.
+            # Score every raw target row independently so Link Health can
+            # show a correct, target-specific score per row (gateway, each
+            # ICMP target, each HTTPS target) instead of reusing one
+            # interface-wide value everywhere.
             row_scores = {
-                target_type: compute_score(probe)
-                for target_type, probe in iface_probes.items()
+                target_id: compute_score(probe)
+                for target_id, probe in iface_probes.items()
             }
+
+            # Aggregate every icmp/https ("Internet") result for this
+            # interface into one robust synthetic probe (see
+            # scoring/aggregation.py) so a single failing endpoint never
+            # by itself makes the interface look unreachable. If there are
+            # no Internet probe results yet, fall back to the interface's
+            # own gateway probe as a purely diagnostic substitute -- the
+            # gateway is never blended into the aggregate itself.
+            aggregate_probe = aggregate_internet_probes(name, iface_probes, timestamp=now)
+            if aggregate_probe is not None:
+                row_scores[aggregate_probe.target_id] = compute_score(aggregate_probe)
+                iface_probes[aggregate_probe.target_id] = aggregate_probe
+                primary_probe = aggregate_probe
+            else:
+                gateway_probe = next(
+                    (p for p in iface_probes.values() if p.target_kind == "gateway"), None
+                )
+                primary_probe = gateway_probe
+
             if row_scores:
                 target_scores[name] = row_scores
 
-            # The "primary" probe/score used for history and the headline
-            # per-interface score consistently prefers the public target,
-            # falling back to the gateway target when public is missing.
-            if "public" in iface_probes:
-                primary_type = "public"
-            elif "gateway" in iface_probes:
-                primary_type = "gateway"
-            else:
-                primary_type = None
-            primary_target[name] = primary_type
-            primary_probe = iface_probes.get(primary_type) if primary_type else None
-            primary_score = row_scores.get(primary_type) if primary_type else None
+            primary_id = primary_probe.target_id if primary_probe is not None else None
+            primary_target[name] = primary_id
+            primary_score = target_scores.get(name, {}).get(primary_id) if primary_id else None
             if primary_score is not None:
                 scores[name] = primary_score
+
+            # Overwrite the emitted probes for this interface with the
+            # local copy (raw target rows + the synthetic aggregate row,
+            # when available) so the Link Health table/history/charts can
+            # render the aggregate exactly like any other row.
+            probes[name] = iface_probes
 
             reachability_now[name] = primary_probe.reachable if primary_probe else None
 

@@ -81,6 +81,7 @@ multilink_manager/
                                only -- never touches the OS adapter/routes)
   scoring/
     scorer.py                Documented 0-100 link quality formula
+    aggregation.py            Documented, pure per-interface ICMP+HTTPS ("Internet") aggregation formula
   steering/                Opt-in automatic active/backup failover (OFF by default)
     policy.py                Pure, OS-independent hysteresis/hold-down/N-cycle decision engine
     controller.py             Orchestrates policy vs. routes.RouteController; save/verify/restore/rollback
@@ -92,6 +93,7 @@ multilink_manager/
   gui/                      PySide6 desktop UI
     worker.py                 QThread that ticks the pipeline above (+ steering) off the GUI thread
     charts.py                  Custom QPainter-based time-series chart (no QtCharts dep)
+    theme.py                   Plain-QSS dark stylesheet + APP_VERSION (cosmetic only, no new dependency)
     main_window.py              Tabs, controls, and Qt-signal-driven rendering (incl. Steering tab)
   tests/                    OS-independent unit tests (platform calls are mocked)
 ```
@@ -109,9 +111,10 @@ CounterMonitor.update()          -> RateSample{}             (delta vs previous 
 compute_distribution()           -> DistributionEntry{}      (monitoring/distribution.py; RX/TX/combined, enabled interfaces only)
 compute_distribution_by_type()   -> DistributionEntry{}      (monitoring/distribution.py; grouped by Ethernet/Wi-Fi/Other, Snapshot.type_distribution, enabled interfaces only)
 list_connections()               -> ConnectionInfo[]         (monitoring/connections.py; attributed against every interface, then filtered -- unattributed connections always kept)
-LinkProber.get_results()         -> ProbeResult{iface:{gateway,public}}  (independent background cadence; provider returns enabled interfaces only, stale entries pruned immediately on disappearance OR deselection)
-compute_score() per target       -> ScoreResult              (scoring/scorer.py; Snapshot.target_scores["iface"]["gateway"|"public"], enabled interfaces only)
-choose primary_target per iface  -> "public" if scored, else "gateway" fallback (Snapshot.primary_target; used for HistoryRecord/history + Link Health "(primary)" label)
+LinkProber.get_results()         -> ProbeResult{iface:{target_id:ProbeResult}}  (independent background cadence; provider returns enabled interfaces only, stale entries pruned immediately on disappearance OR deselection; target_id is "gateway:<ip>"/"icmp:<target>"/"https:<url>", so multiple ICMP/HTTPS targets never overwrite each other)
+compute_score() per row          -> ScoreResult              (scoring/scorer.py; Snapshot.target_scores["iface"][target_id], one score per gateway/ICMP/HTTPS row, enabled interfaces only)
+aggregate_internet_probes()      -> ProbeResult|None          (scoring/aggregation.py; combines every icmp/https row per interface into one robust synthetic "aggregate" row -- reachable if ANY Internet probe is reachable, unknown only if ALL are unknown; quality uses reachable probes and ICMP timing is preferred over HTTPS timing; gateway is NEVER blended in)
+choose primary_target per iface  -> "aggregate" if any Internet probe result exists, else that interface's own gateway target_id as a diagnostic-only fallback (Snapshot.primary_target; used for HistoryRecord/history + Link Health "(primary)" label + headline score)
 HistoryStore.add_many()          -> retained for the configured time window, using each interface's primary_target score/RTT/loss/jitter (enabled interfaces only)
 SteeringController.tick()        -> SteeringStatus            (steering/controller.py; no-op unless explicitly enabled; sees every interface for the VPN/Other guard and target-metric planning, but enabled_names restricts which interfaces can ever become a switch candidate; carried as Snapshot.steering_status)
 Snapshot                         -> emitted via Qt signal to MainWindow for rendering
@@ -121,19 +124,24 @@ Snapshot                         -> emitted via Qt signal to MainWindow for rend
 GUI refresh cadence. Each tick it first drops any stale results for
 interfaces that have disappeared since the previous tick (so a removed
 adapter never lingers in Link Health), then probes each configured target
-(gateway + public endpoint) for each known interface **sequentially, in a
-plain loop** on that single background thread - deliberately *not* via a
-nested `ThreadPoolExecutor`. This is a stability-motivated design choice:
-during development, running probes through an additional thread-pool layer
-underneath both a `QThread` and `LinkProber`'s own thread (three
-independently process-spawning thread layers at once) was observed to
-occasionally trigger a native crash at Python interpreter shutdown in a
-constrained test environment. Sequential probing removes that third layer
-entirely; for a typical handful of interfaces and two targets each, a full
-probe pass still completes well within the default 5s probe interval. A
-small `threading.Semaphore` in `utils/platform_utils.py` additionally caps
-how many `powershell.exe`/`ping.exe` child processes may be in flight at
-once from any caller, as a cheap extra safety margin. `MonitorWorker` is a
+(gateway + every configured ICMP target + every configured HTTPS target)
+for each known interface **sequentially, in a plain loop** on that single
+background thread - deliberately *not* via a nested `ThreadPoolExecutor`.
+This is a stability-motivated design choice: during development, running
+probes through an additional thread-pool layer underneath both a
+`QThread` and `LinkProber`'s own thread (three independently
+process-spawning thread layers at once) was observed to occasionally
+trigger a native crash at Python interpreter shutdown in a constrained
+test environment. Sequential probing removes that third layer entirely;
+for a typical handful of interfaces with two ICMP + two HTTPS targets
+each, a full probe pass still normally completes within the default probe
+interval, though HTTPS probes (a full TCP+TLS handshake plus HTTP
+round-trip per attempt) are considerably more expensive per attempt than
+an ICMP echo -- see "Known limitations" if you configure many HTTPS
+targets across many interfaces. A small `threading.Semaphore` in
+`utils/platform_utils.py` additionally caps how many
+`powershell.exe`/`ping.exe` child processes may be in flight at once from
+any caller, as a cheap extra safety margin. `MonitorWorker` is a
 `QThread`; all its work (discovery, psutil calls, PowerShell calls, probe
 polling, and steering decisions/mutations when enabled) happens off the Qt
 GUI thread, and results are only ever pushed to the GUI via the
@@ -203,26 +211,33 @@ python -m multilink_manager.app
 Optional flags:
 
 ```powershell
-python -m multilink_manager.app --log-level DEBUG --log-file multilink_manager.log --public-target 1.1.1.1
+python -m multilink_manager.app --log-level DEBUG --log-file multilink_manager.log --icmp-targets "1.1.1.1, 8.8.8.8" --https-targets "https://www.gstatic.com/generate_204, https://connectivitycheck.gstatic.com/generate_204"
 ```
 
-`--public-target` only pre-fills the GUI's **Public target** field (see
-below); it is optional on the command line because the field itself is
-editable and validated in the GUI before every Start.
+`--icmp-targets`/`--https-targets` only pre-fill the GUI's **ICMP
+targets**/**HTTPS targets** fields (see below); they are optional on the
+command line because both fields are editable and validated in the GUI
+before every Start. `--public-target` is kept as a **deprecated** alias
+for a single-entry `--icmp-targets` (a warning is logged if used); if both
+are given, `--icmp-targets` wins.
 
 In the window:
 
-1. Enter a **Public target** (IPv4 address or hostname, e.g. `1.1.1.1`) in
-   the control bar text field. This is the configurable public endpoint
-   probed independently per interface; it is required and validated
-   (non-empty) when you click **Start** - an empty field is rejected with
+1. Enter comma-separated **ICMP targets** (IPv4 addresses or hostnames,
+   default `1.1.1.1, 8.8.8.8`) and, optionally, comma-separated **HTTPS
+   targets** (URLs, default the two `generate_204` endpoints below) in the
+   control bar. Each configured target is probed **independently per
+   enabled interface**. At least one ICMP target is required and validated
+   (non-empty, comma-separated) when you click **Start**; HTTPS targets
+   are optional but each entry, if any, is validated to be a well-formed
+   `http://`/`https://` URL with a hostname. Invalid input is rejected with
    an inline error and monitoring will not start. The gateway target is
    always automatic (each interface's own default gateway) and needs no
    input.
 2. Click **Start** to begin monitoring (background worker thread starts;
-   link probing starts on its own background thread using the public
-   target you entered). The public-target field is disabled while running
-   to avoid changing it mid-session; **Stop** re-enables it.
+   link probing starts on its own background thread using the ICMP/HTTPS
+   targets you entered). Both target fields are disabled while running to
+   avoid changing them mid-session; **Stop** re-enables them.
 3. Adjust **Interval (s)** to change how often the GUI refreshes (counter
    read / connection scan cadence). This does not change the probe
    cadence, which is independent.
@@ -241,7 +256,9 @@ In the window:
 
 Tabs:
 
-- **Dashboard** - three panels: (1) **Current path**, the interface
+- **Dashboard** - a **Summary** card (interfaces enabled count, best
+  current aggregate Internet score, automatic-steering ON/OFF at a
+  glance) plus three panels: (1) **Current path**, the interface
   Windows currently prefers for the default IPv4 route computed from each
   interface's *effective* route metric (`RouteMetric + InterfaceMetric`,
   lowest wins - not `RouteMetric` alone), shown for information only; this
@@ -253,32 +270,46 @@ Tabs:
   only clarifies that this app is not currently tracking that interface.
   (2) **RX/TX/Combined traffic distribution**, current-tick percentage
   bars per interface. (3) **Link Health**, one row per interface **per
-  target** (gateway and public each get their own row with their own
-  RTT/loss/jitter/ reachability/score); the row whose score is used for
-  history/scoring purposes is labelled `(primary)` - public-preferred,
-  falling back to gateway only when the public probe itself has no usable
-  result. Deselected interfaces never appear in Link Health.
+  probe target** - a separate row each for the gateway, every configured
+  ICMP target, and every configured HTTPS target, each with its own
+  Kind/Endpoint/Reachable/Latency/Loss/Jitter/HTTP Status/Score - plus one
+  additional synthetic **"Internet (aggregate)"** row per interface
+  robustly combining every ICMP/HTTPS result (see
+  [Scoring](#scoring-and-history) below). The row actually used for
+  history/steering is labelled `(primary)` - the aggregate row whenever
+  any Internet probe result exists, falling back to the interface's own
+  gateway row only when there is no Internet probe result at all yet
+  (e.g. immediately after Start). Deselected interfaces never appear in
+  Link Health.
 - **Live Traffic** - an explicit per-interface counters table (cumulative
   RX/TX bytes, cumulative RX/TX packets, cumulative RX/TX errors and
   discards, current RX/TX/Total Mbps, RX/TX pps - 14 columns), plus seven
   rolling time-series charts: RX Mbps, TX Mbps, Combined Mbps (per
   interface plus a `TOTAL` series), Ethernet/Wi-Fi/Other percentage
   distribution over time, latency (ms), packet loss (%), and link score,
-  each per interface. All seven charts share the same retention-driven
-  time window and are all cleared together by **Clear History**.
+  each per interface (latency/loss/score use each interface's `(primary)`
+  row). All seven charts share the same retention-driven time window and
+  are all cleared together by **Clear History**.
 - **Interfaces** - full interface metadata table (type, classification
   source, status, addresses, MAC, negotiated link speed, network profile,
-  gateways) for **every** discovered interface, plus a leading
-  **Enabled** checkbox column controlling whether that interface is
-  included in monitoring (see "Interface selection" below). This tab
-  always lists every discovered interface regardless of its enabled
-  state, so a deselected adapter remains visible and can be re-enabled at
-  any time. Two buttons above the table: **Select physical defaults**
-  resets every interface back to its type-based default (checked for
-  Ethernet/Wi-Fi, unchecked for Other/Unknown/virtual/VPN/loopback -
-  classification is never based on adapter name); **Deselect all**
-  unchecks every interface. Toggling a checkbox takes effect on the next
-  tick without needing to Stop/Start.
+  gateways) plus a leading **Enabled** checkbox column controlling whether
+  that interface is included in monitoring (see "Interface selection"
+  below). A **Show all adapters** checkbox (default **OFF**) controls
+  which rows are listed: OFF hides only *disabled* Other/Unknown/
+  virtual/VPN/loopback adapters (any enabled interface, of any
+  classification, and any Ethernet/Wi-Fi interface even if currently
+  disabled, always stay visible so a physical NIC that is momentarily
+  unplugged/deselected remains discoverable and re-enable-able); ON lists
+  every discovered interface unconditionally, with its Enabled checkbox,
+  so you can inspect or enable anything (e.g. a VPN/virtual adapter) on
+  demand. A deselected adapter is never truly removed from the app's
+  memory by this toggle - it can always be re-enabled, at which point it
+  becomes visible even with **Show all adapters** OFF. Two buttons above
+  the table: **Select physical defaults** resets every interface back to
+  its type-based default (checked for Ethernet/Wi-Fi, unchecked for
+  Other/Unknown/virtual/VPN/loopback - classification is never based on
+  adapter name); **Deselect all** unchecks every interface. Toggling a
+  checkbox takes effect on the next tick without needing to Stop/Start.
 - **Applications / Connections** - process/PID/endpoint/protocol/state per
   connection, with interface attribution and an explicit "unavailable"
   byte-counter column.
@@ -287,6 +318,14 @@ Tabs:
   failover. See [Automatic failover (opt-in)](#automatic-failover-opt-in)
   below for the full algorithm, safety model, and required confirmation
   steps before using it.
+
+The window uses a single coherent dark, neutral Qt stylesheet
+(`gui/theme.py`, plain QSS applied via `setStyleSheet()` - no new GUI
+dependency) for readability: distinct card-style group boxes, colored
+Start/Stop buttons, consistent table/header styling, and a Dashboard
+Summary card. This is purely cosmetic - it changes no data, no
+measurement, and no widget behavior. The window title includes the
+current app version (`gui/theme.APP_VERSION`).
 
 ### Interface selection (per-adapter monitoring enable/disable)
 
@@ -309,22 +348,28 @@ an adapter; a deselected interface's OS state is completely untouched.
   later reappears (e.g. unplug/replug a USB NIC, or a VPN client
   reconnecting under the same adapter name).
 - **What gets excluded** when an interface is deselected: link probing
-  (gateway/public RTT/loss/jitter/reachability), the Live Traffic
-  counters table and all seven history charts, the RX/TX/combined
-  distribution (both current-tick bars and the percentage-over-time
-  chart), history retained for CSV export, Link Health rows on the
-  Dashboard, and eligibility as an automatic-steering switch candidate.
-  Connections/applications whose local IP address exactly matches a
-  deselected interface are hidden from the Applications/Connections tab;
-  connections that cannot be attributed to any interface at all
-  (`laddr` unknown/loopback/wildcard) remain shown regardless, since they
-  were never attributed to the deselected interface in the first place.
-- **What is never hidden**: the Interfaces tab itself always lists every
-  discovered interface so it can be re-enabled later, and the Dashboard's
-  "Current path" always reports Windows' real, currently-preferred
-  interface even if that interface happens to be deselected (annotated
-  with a `[DESELECTED]` note rather than substituted or hidden) - this
-  app never misrepresents what Windows itself is actually doing.
+  (gateway/ICMP/HTTPS/aggregate RTT or HTTP latency/loss/jitter/
+  reachability), the Live Traffic counters table and all seven history
+  charts, the RX/TX/combined distribution (both current-tick bars and the
+  percentage-over-time chart), history retained for CSV export, Link
+  Health rows on the Dashboard, and eligibility as an automatic-steering
+  switch candidate. Connections/applications whose local IP address
+  exactly matches a deselected interface are hidden from the
+  Applications/Connections tab; connections that cannot be attributed to
+  any interface at all (`laddr` unknown/loopback/wildcard) remain shown
+  regardless, since they were never attributed to the deselected interface
+  in the first place.
+- **What is never hidden**: the Interfaces tab can always list every
+  discovered interface (toggle **Show all adapters** ON) so any of them
+  can be re-enabled later, and the Dashboard's "Current path" always
+  reports Windows' real, currently-preferred interface even if that
+  interface happens to be deselected (annotated with a `[DESELECTED]`
+  note rather than substituted or hidden) - this app never misrepresents
+  what Windows itself is actually doing. With **Show all adapters** OFF
+  (the default), only *disabled* Other/Unknown/virtual/VPN/loopback
+  adapters are hidden from the table view - this affects table visibility
+  only, never the underlying enabled/disabled state or eligibility to be
+  re-enabled.
 - **Steering safety**: a deselected interface can never be chosen as an
   automatic-failover switch target, regardless of its score, because the
   candidate-building step is filtered by the same enabled set used
@@ -399,8 +444,10 @@ automatic steering" click, exactly as when running from source.
 | Cumulative bytes/packets/errors/discards | `psutil.net_io_counters(pernic=True)` | Direct read of OS-maintained interface counters (IP Helper API on Windows) | Exact cumulative counters as reported by the OS; wraps/resets are detected (see below) |
 | RX/TX Mbps, pps | Computed in `monitoring/counters.py` | `(byte_delta * 8) / (interval_s * 1e6)`; `packet_delta / interval_s` | This is **observed local interface traffic** (everything crossing that NIC), **not** the throughput of any single Internet path or application |
 | RX/TX/combined distribution % | Computed in `monitoring/distribution.py` | Interface's byte delta as a % of the summed delta across all interfaces for that tick | 0% for all interfaces when total traffic for the tick is zero (not NaN, not an artificial even split) |
-| RTT / loss / jitter / reachability | `ping.exe -S <source_ip>` per interface | Windows-supported source-address binding for ICMP Echo; RTT = mean of successful replies; loss = 100% * (1 - received/sent) using ping.exe's own summary line when available; jitter = mean absolute difference between consecutive successful RTT samples | See "Source-bound ping limitation" below. `None` fields mean "not measurable this cycle", never a fabricated value |
-| Link quality score | `scoring/scorer.py` | Deterministic formula from loss/latency/jitter/reachability (see below) | `None` when reachability itself is unknown |
+| RTT / loss / jitter / reachability (gateway + ICMP targets) | `ping.exe -S <source_ip>` per interface, per target | Windows-supported source-address binding for ICMP Echo; RTT = mean of successful replies; loss = 100% * (1 - received/sent) using ping.exe's own summary line when available; jitter = mean absolute difference between consecutive successful RTT samples | See "Source-bound ping/HTTP limitation" below. `None` fields mean "not measurable this cycle", never a fabricated value |
+| HTTP(S) latency / loss / jitter / reachability / status (HTTPS targets) | stdlib `http.client.HTTPConnection`/`HTTPSConnection(..., source_address=(source_ip, 0))` per interface, per target | Source-bound TCP+TLS+HTTP GET; **latency here is HTTP request/response round-trip time, NOT an ICMP RTT** - labelled distinctly ("HTTPS" kind) everywhere in the UI. Any HTTP response, including 4xx/5xx, proves that the transport round trip succeeded and contributes timing without being misreported as packet loss; endpoint error status remains visible. Jitter is the mean absolute difference between consecutive response timings | Considerably more expensive per attempt than ICMP (full TLS handshake); default 2 attempts/3s timeout per target per interface per tick. `None`/`error` fields are never fabricated |
+| Per-interface aggregate Internet score/health (`target_kind="aggregate"`) | `scoring/aggregation.py` `aggregate_internet_probes()` | Combines every ICMP+HTTPS result: reachable if ANY is reachable, unknown only if ALL are unknown. While any endpoint is reachable, quality uses reachable probes so one unrelated outage cannot tank the score. Latency/jitter prefer ICMP RTT and use HTTPS request timing only as fallback. Gateway is used only when no Internet result exists yet and is never blended into the aggregate | Documented, pure, unit-tested formula (see `tests/test_aggregation.py`) |
+| Link quality score | `scoring/scorer.py` | Deterministic formula from loss/latency/jitter/reachability (see below), computed independently for every gateway/ICMP/HTTPS/aggregate row | `None` when reachability itself is unknown |
 | Process/PID/endpoints/protocol/state | `psutil.net_connections(kind="inet")` + `psutil.Process(pid).name()` | Direct read | Requires elevation for full visibility into other users'/system processes; degrades to an empty list (logged) if denied, never fabricated |
 | Per-connection interface attribution | Exact match of `laddr.ip` against each interface's known IPv4/IPv6 addresses | Direct set-membership lookup | `None` when the local address is `0.0.0.0`/`::`, loopback-only, or doesn't exactly match a currently known interface address - **never inferred from the routing table or heuristics** |
 | Per-connection byte counters | **Not modeled.** | N/A | `psutil` does not expose per-socket byte counters on Windows. Real per-connection throughput requires a kernel driver, ETW flow logging, WFP callouts, or packet capture (WinDivert/npcap) - all out of scope for this MVP's "never install drivers" constraint. Rendered as "unavailable" everywhere, never as `0`. |
@@ -424,25 +471,29 @@ throughout the app and the data model:
    counter row above); only which process owns which connection and (by
    exact local-IP match) which interface that connection is bound to.
 
-### Source-bound ping limitation and Windows routing behavior
+### Source-bound ping/HTTP limitation and Windows routing behavior
 
 `ping.exe -S <source_ip>` asks Windows to *originate* the ICMP Echo Request
-from a specific local address. This is the Windows-supported mechanism
-this MVP uses to probe "through" a specific interface without touching the
-routing table. However:
+from a specific local address, and `http.client.HTTPConnection(...,
+source_address=(source_ip, 0))` does the analogous thing for outbound TCP
+sockets used by HTTPS probes. Both are the Windows-supported/stdlib
+mechanisms this MVP uses to probe "through" a specific interface without
+touching the routing table. However:
 
 - Windows' route selection for the *destination* is still governed by the
-  routing table at the time of the ping, not solely by the chosen source
+  routing table at the time of the probe, not solely by the chosen source
   address. If no route exists via that source interface's subnet/gateway
   for the destination, Windows may still send the packet out a *different*
-  interface (or fail outright), because `-S` constrains the source address
-  of the packet, not the egress adapter selection itself.
+  interface (or fail outright), because binding the source address
+  constrains the source address of the packet, not the egress adapter
+  selection itself. This applies equally to ICMP probes and to the TCP
+  sockets used for HTTPS probes.
 - As a result, a probe issued "from" interface A's IP can, in unusual
   routing configurations (e.g. asymmetric multi-homing, overlapping
   subnets, VPN split-tunnel routes), actually traverse a different NIC.
-  The RTT/loss/jitter reported for interface A in that case reflects
-  whatever path Windows actually used, which may not be interface A's
-  physical path.
+  The RTT/loss/jitter (or HTTP latency/loss/jitter) reported for interface
+  A in that case reflects whatever path Windows actually used, which may
+  not be interface A's physical path.
 - This is a fundamental limitation of user-mode, non-driver source-address
   probing on Windows and is called out in the UI's Link Health tab
   description and here rather than silently assumed away.
@@ -475,21 +526,64 @@ affects real-time/interactive traffic and is the least universally
 impactful of the three. Each component is capped so no single metric alone
 can claim the entire 0-100 range without corroboration from the others.
 
-**Per-target scores vs. the "primary" score.** `compute_score()` is run
-independently for **each** probe target (gateway and public) of each
-interface, so the Link Health table can show a gateway score and a public
-score side by side without one overwriting the other. For history/CSV
-export and the Live Traffic score chart, each interface needs exactly
-*one* score per tick; this "primary" score is chosen as the **public**
-target's score whenever the public probe produced a usable result that
-tick, and falls back to the **gateway** target's score only when the
-public probe itself has no usable result (e.g. the public endpoint is
-unreachable or not yet sampled). This keeps the historical/health score
-consistently anchored to "can this interface actually reach the Internet"
-when that information is available, while still surfacing *something*
-meaningful (LAN-segment reachability) when it isn't. The Dashboard's Link
-Health table marks whichever row was chosen this way with a `(primary)`
-suffix so it is never ambiguous which score is being recorded.
+**Per-target scores vs. the "primary" (aggregate) score.**
+`compute_score()` is run independently for **every** probe row (gateway,
+each ICMP target, each HTTPS target, and the synthetic aggregate) of each
+interface, so the Link Health table can show a distinct score per target
+side by side without one overwriting another (each row is keyed by a
+stable `target_id`, e.g. `"icmp:8.8.8.8"` or `"https:https://a/b"`, so
+multiple same-kind targets never collide). For history/CSV export and the
+Live Traffic score chart, each interface needs exactly *one* score per
+tick; this "primary" score is the **aggregate Internet score**
+(`aggregate_internet_probes()` - see below) whenever any ICMP/HTTPS probe
+result exists for that interface, and falls back to the **gateway**
+target's score only when there is no Internet probe result at all yet
+(e.g. immediately after Start, before the first probe cycle completes).
+This keeps the historical/health score consistently anchored to "can this
+interface actually reach the Internet" when that information is
+available, while still surfacing *something* meaningful (LAN-segment
+reachability) when it isn't. The Dashboard's Link Health table marks
+whichever row was chosen this way with a `(primary)` suffix so it is never
+ambiguous which score is being recorded.
+
+### Aggregation formula (per-interface Internet health/score)
+
+See `multilink_manager/scoring/aggregation.py` for the authoritative,
+pure, unit-tested (`tests/test_aggregation.py`) implementation. Given
+every ICMP/HTTPS ("Internet") `ProbeResult` for one interface at one tick
+(the interface's own **gateway** probe is deliberately **excluded** from
+this blend):
+
+1. **Reachable**: `True` if *at least one* Internet probe is confirmed
+   reachable, regardless of how many others failed - a single failing
+   endpoint must never by itself make an otherwise-healthy interface look
+   unreachable. `None` (unknown) only if *every* Internet probe result is
+   itself unknown. `False` otherwise (at least one definite answer, but
+   none succeeded).
+2. **Quality metrics** use confirmed-reachable probes whenever at least
+   one endpoint is reachable, so an unrelated endpoint outage remains
+   visible in its own row without tanking an otherwise healthy link. If
+   every endpoint is unreachable, known loss values from those failures
+   are retained.
+3. **Latency and jitter** prefer reachable ICMP probes because ICMP RTT
+   and HTTPS request/TLS latency are not comparable measurements. HTTPS
+   timings are used only when no reachable ICMP timing is available.
+4. **samples_sent / samples_received**: summed across every contributing
+   probe (informational only).
+5. If there are **zero** Internet probe results at all for the interface,
+   `aggregate_internet_probes()` returns `None` and `MonitorWorker` falls
+   back to that interface's own gateway probe as a purely diagnostic
+   substitute - the gateway is never blended into the aggregate itself,
+   since a healthy LAN hop to the gateway says nothing about real
+   Internet reachability, and folding it in would let a fully
+   Internet-down interface still report "reachable" through a perfectly
+   healthy local gateway.
+
+This keeps interface-level health/score (used for the Dashboard Summary/
+headline, history charts, and automatic-steering candidate scoring)
+robust to any single configured Internet endpoint's outage, while
+remaining fully transparent (via the per-target rows in Link Health)
+about exactly which individual endpoints are and are not reachable.
 
 ---
 
@@ -498,9 +592,11 @@ suffix so it is never ambiguous which score is being recorded.
 The 8 procedures below are organized by the exact **scenario** requested
 (not by feature), so each one is a self-contained script you can run
 against a machine with at least one Ethernet and one Wi-Fi adapter. Start
-the app first (`python -m multilink_manager.app`), enter a **Public
-target** (e.g. `1.1.1.1`), click **Start**, and keep it running throughout
-each scenario. Within each scenario, check whatever tabs are called out.
+the app first (`python -m multilink_manager.app`), keep the default
+**ICMP targets** (`1.1.1.1, 8.8.8.8`) and **HTTPS targets** (the two
+`generate_204` endpoints) or enter your own, click **Start**, and keep it
+running throughout each scenario. Within each scenario, check whatever
+tabs are called out.
 
 1. **Ethernet only** (Wi-Fi disabled/disconnected, Ethernet connected with
    Internet access)
@@ -508,8 +604,10 @@ each scenario. Within each scenario, check whatever tabs are called out.
      `Status = up`, valid IPv4/MAC/negotiated link speed; any Wi-Fi adapter
      shows `down` or is simply not carrying traffic.
    - **Dashboard**: "Current path" names the Ethernet interface. Link
-     Health shows a `gateway` and a `public` row for it, both
-     `Reachable = Yes`, with the `public` row marked `(primary)`.
+     Health shows a `Gateway` row, one row per configured `ICMP` target,
+     one row per configured `HTTPS` target, and one `Internet (aggregate)`
+     row for it - all `Reachable = Yes`, with the `Internet (aggregate)`
+     row marked `(primary)`.
    - **Live Traffic**: the counters table shows the Ethernet row's
      cumulative bytes/packets increasing tick over tick; RX/TX/Total Mbps
      non-zero if traffic is flowing.
@@ -518,8 +616,8 @@ each scenario. Within each scenario, check whatever tabs are called out.
    Internet access)
    - Same checks as scenario 1, but for the Wi-Fi adapter: **Interfaces**
      shows `Type = wifi`, an associated `Network profile`; **Dashboard**
-     "Current path" names the Wi-Fi interface; Link Health's `public`
-     row for it is `(primary)` and reachable.
+     "Current path" names the Wi-Fi interface; Link Health's
+     `Internet (aggregate)` row for it is `(primary)` and reachable.
 
 3. **Both simultaneously** (Ethernet and Wi-Fi both connected with
    Internet access at the same time)
@@ -532,7 +630,8 @@ each scenario. Within each scenario, check whatever tabs are called out.
      InterfaceAlias, InterfaceMetric` and `Get-NetRoute -DestinationPrefix
      0.0.0.0/0 | Select InterfaceAlias, RouteMetric` - the interface with
      the lowest **sum**, not necessarily the lowest `RouteMetric` alone,
-     should match. Both interfaces get independent Link Health rows.
+     should match. Both interfaces get independent Link Health rows (and
+     independent `Internet (aggregate)` rows).
    - **Live Traffic** distribution bars (RX/TX/Combined) split
      proportionally between the two interfaces rather than showing 100%
      on one arbitrarily.
@@ -559,14 +658,19 @@ each scenario. Within each scenario, check whatever tabs are called out.
 6. **One interface connected without Internet access** (e.g. Ethernet
    plugged into a LAN switch with no upstream Internet, or a Wi-Fi AP with
    no WAN)
-   - **Dashboard** Link Health: the `gateway` row for that interface is
+   - **Dashboard** Link Health: the `Gateway` row for that interface is
      still `Reachable = Yes` (LAN hop responds) with a normal score, but
-     the `public` row is `Reachable = No` with RTT/jitter shown as blank
-     (`n/a`), never `0`, and its score is `0.0` (confirmed unreachable, not
-     `None`). Because the public probe has no usable result, the
-     `(primary)` label falls back to the `gateway` row for that interface
-     per the documented fallback rule (see Scoring formula above) -
-     confirm exactly one row per interface is marked `(primary)`.
+     every `ICMP`/`HTTPS` row is `Reachable = No` with latency/jitter shown
+     as blank (`n/a`), never `0`, and each of their scores is `0.0`
+     (confirmed unreachable, not `None`). The `Internet (aggregate)` row
+     is likewise `Reachable = No` (since at least one definite unreachable
+     answer exists and none succeeded) with score `0.0`; because an
+     Internet probe result *does* exist (just all unreachable), the
+     `(primary)` label stays on the `Internet (aggregate)` row, **not**
+     the `Gateway` row, per the documented fallback rule (see Scoring
+     formula above) - the gateway-only fallback is reserved for when there
+     is no Internet probe result *at all* yet, not merely a failing one.
+     Confirm exactly one row per interface is marked `(primary)`.
 
 7. **Generate traffic on both simultaneously** (both interfaces connected
    with Internet access, both actively transferring)
@@ -607,25 +711,38 @@ top of them:
    interface, connect it (or otherwise ensure at least one `Other`-
    classified interface is present) alongside a physical Ethernet or
    Wi-Fi adapter, then Start monitoring.
-2. **Interfaces** tab: confirm the physical Ethernet/Wi-Fi adapter(s) show
-   the **Enabled** checkbox checked by default, and the VPN/virtual/Other
-   adapter shows it **unchecked** by default - with no adapter-name-based
-   logic involved (classification is by Windows media-type metadata).
+2. **Interfaces** tab: with **Show all adapters** OFF (the default), the
+   VPN/virtual/Other adapter is **hidden** (only *disabled* Other/Unknown
+   adapters are hidden by default) while the physical Ethernet/Wi-Fi
+   adapter(s) remain visible and show the **Enabled** checkbox checked by
+   default - with no adapter-name-based logic involved anywhere
+   (classification is by Windows media-type metadata). Toggle
+   **Show all adapters** ON to confirm the VPN/virtual/Other adapter is
+   now listed too, with its **Enabled** checkbox **unchecked** by default.
 3. Uncheck the physical adapter's **Enabled** box. Within one tick,
    confirm it disappears from **Dashboard** Link Health, from the **Live
    Traffic** counters table and all seven history charts, and from the
    RX/TX/Combined distribution bars - while it remains visible (still
-   listed, just unchecked) on the **Interfaces** tab itself.
+   listed, just unchecked) on the **Interfaces** tab itself (a disabled
+   physical Ethernet/Wi-Fi adapter is never hidden by "Show all adapters"
+   OFF, only a disabled Other/Unknown adapter is).
 4. Re-check the box. Confirm the interface reappears in Link Health/Live
    Traffic/distribution within one tick, and that its counters resume
    from a sane baseline (no artificial traffic spike from the gap).
-5. Click **Select physical defaults**. Confirm every Ethernet/Wi-Fi
+5. With **Show all adapters** ON, manually check the VPN/virtual/Other
+   adapter's **Enabled** box, then toggle **Show all adapters** back OFF.
+   Confirm the now-enabled Other adapter **stays visible** (a manually
+   enabled adapter is never hidden, regardless of classification).
+6. Click **Select physical defaults**. Confirm every Ethernet/Wi-Fi
    adapter becomes checked and every Other/Unknown adapter becomes
-   unchecked, regardless of any manual overrides made in steps 3-4.
-6. Click **Deselect all**. Confirm every adapter becomes unchecked and
+   unchecked, regardless of any manual overrides made in steps 3-5 (with
+   **Show all adapters** OFF, the now-disabled Other adapter from step 5
+   disappears from the table again, matching the default-hidden rule).
+7. Click **Deselect all**. Confirm every adapter becomes unchecked and
    Link Health / Live Traffic / distribution go empty for all interfaces,
-   while the Interfaces tab itself still lists all of them.
-7. If Steering is enabled, confirm a deselected interface never appears
+   while the Interfaces tab (with **Show all adapters** ON) still lists
+   all of them.
+8. If Steering is enabled, confirm a deselected interface never appears
    as a switch candidate/target even if it would otherwise score higher
    than the active path (covered automatically by
    `tests/test_steering_controller.py::test_deselected_interface_never_becomes_steering_candidate`,
@@ -753,14 +870,15 @@ interface, and decides whether to switch:
 editable only while steering is disabled); if you don't need to change
 them, the named, documented `SteeringConfig` defaults above apply.
 
-**Health source for decisions.** Per the same public-preferred/gateway-
+**Health source for decisions.** Per the same aggregate-Internet/gateway-
 fallback rule used for Link Health/history elsewhere in this app, each
-interface's health for steering purposes uses its **public probe** score
-when the public probe has a usable result that tick, falling back to its
-**gateway** probe score only when the public probe itself has no usable
-result. A gateway-fallback score is therefore an acceptable steering input
-only when the public probe is genuinely unavailable that tick - it is
-never preferred over a usable public-probe score.
+interface's health for steering purposes uses its **aggregate Internet**
+score (`aggregate_internet_probes()` over every configured ICMP/HTTPS
+target) whenever any Internet probe result exists for that interface that
+tick, falling back to its **gateway** probe score only when there is no
+Internet probe result at all yet. A gateway-fallback score is therefore an
+acceptable steering input only when no Internet probe result is available
+- it is never preferred over a usable aggregate-Internet score.
 
 ### Save / apply / verify / restore / rollback
 
@@ -857,7 +975,8 @@ both connected with Internet access:
    Steering tab, and click **Enable automatic steering...**; accept the
    confirmation dialog.
 3. If the currently active interface is artificially made "unhealthy"
-   (e.g. temporarily unplug it, or block ICMP to the public target on it)
+   (e.g. temporarily unplug it, or block ICMP/HTTPS to its configured
+   probe targets on it)
    and a healthier eligible candidate exists, after the configured
    confirmation cycles you should see the Steering status panel's
    "Candidate/target" and "Active path" update, and a log line at `INFO`
@@ -927,8 +1046,17 @@ below.
   discards; derived Mbps/pps.
 - RX/TX/combined traffic distribution across interfaces.
 - In-memory time-window history with CSV export.
-- Independent per-interface source-bound ping probing: RTT, loss, jitter,
-  reachability, against gateway and a configurable public endpoint.
+- Independent per-interface source-bound ICMP probing (gateway plus
+  configurable multi-target ICMP endpoints, default `1.1.1.1`/`8.8.8.8`):
+  RTT, loss, jitter, reachability.
+- Independent per-interface source-bound HTTPS probing (configurable
+  multi-target endpoints, default two `generate_204` connectivity-check
+  URLs): HTTP request/response latency, loss, jitter, reachability, HTTP
+  status - clearly labelled distinctly from ICMP RTT.
+- Robust per-interface aggregate Internet health/score
+  (`aggregate_internet_probes()`) combining all configured ICMP/HTTPS
+  results so a single endpoint's outage does not alone force an
+  otherwise-healthy interface to look unreachable.
 - Deterministic, documented 0-100 link quality scoring.
 - Process/connection enumeration with protocol/state/endpoints and
   exact-match interface attribution.
@@ -947,7 +1075,7 @@ below.
   selection only.
 - Guaranteed interface attribution for probes when Windows' actual route
   selection diverges from the requested source address (see "Source-bound
-  ping limitation").
+  ping/HTTP limitation").
 - IPv6 default gateway/profile parity is best-effort; some fields may be
   `None` on IPv6-only or dual-stack edge configurations not exercised in
   testing.
@@ -976,18 +1104,24 @@ above.)*
   can only see connections owned by the current user's processes unless
   the app is run elevated; the app logs this and returns an empty list
   rather than partial/misleading data.
-- **Ping-based probing is coarse and now strictly sequential.**
-  `ping.exe` invocations have their own process-start latency and are not
-  a substitute for a dedicated low-level ICMP/UDP probing library. As of
-  this revision, `LinkProber` probes every interface/target pair
-  **sequentially** on its own single background thread rather than
-  concurrently via a thread pool - a deliberate stability tradeoff (see
-  Architecture above). This means a full probe pass's wall-clock duration
-  is roughly the *sum* of each individual `ping.exe` call's latency, which
-  scales with the number of interfaces and targets; for a typical 2-3
-  interface setup with 2 targets each this stays comfortably within the
-  default 5s probe interval, but a machine with many virtual/VPN adapters
-  may see slower probe cadence than the configured interval.
+- **Ping-based / HTTP-based probing is coarse and now strictly
+  sequential.** `ping.exe` invocations have their own process-start
+  latency and are not a substitute for a dedicated low-level ICMP/UDP
+  probing library; HTTP(S) probes add a full TCP+TLS handshake plus HTTP
+  round-trip per attempt, considerably more expensive per attempt than an
+  ICMP echo. As of this revision, `LinkProber` probes every
+  interface/target pair (gateway + every configured ICMP target + every
+  configured HTTPS target) **sequentially** on its own single background
+  thread rather than concurrently via a thread pool - a deliberate
+  stability tradeoff (see Architecture above). This means a full probe
+  pass's wall-clock duration is roughly the *sum* of each individual
+  probe's latency, which scales with the number of interfaces and
+  targets; for a typical 2-3 interface setup with the default 2 ICMP + 2
+  HTTPS targets this stays within a reasonable multiple of the default 5s
+  probe interval, but a machine with many virtual/VPN adapters or many
+  configured targets may see slower probe cadence than the configured
+  interval - reduce the number of HTTPS targets first if this is
+  observed, since they are the most expensive per attempt.
 - **Observed intermittent process-exit-time instability in constrained
   test environments.** During development, this application occasionally
   exhibited a native crash (Windows STATUS_STACK_BUFFER_OVERRUN) at Python
@@ -1058,9 +1192,12 @@ already exists today):
   the dependency footprint is acceptable for the target deployment, to
   support smoother high-frequency rendering and richer interactions (zoom,
   pan, tooltips) than the current custom-painted widget.
-- **Add multi-endpoint/geo-diverse public probing** with statistical
-  aggregation (percentiles, not just mean) for more robust Internet-path
-  quality signals distinct from local-interface traffic.
+- **Extend multi-endpoint probing with percentile-based statistics**
+  (not just mean) and optional geo-diverse/anycast-aware endpoint sets,
+  building on the multi-target ICMP+HTTPS probing and per-interface
+  aggregation already implemented in this revision (see
+  `scoring/aggregation.py`), for even more robust Internet-path quality
+  signals distinct from local-interface traffic.
 - **Formal integration tests behind a Windows-only CI matrix** (in
   addition to today's OS-independent mocked unit tests) to catch
   regressions in the PowerShell-dependent code paths.

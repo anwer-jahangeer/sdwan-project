@@ -8,7 +8,7 @@ from multilink_manager.scoring.scorer import compute_score
 
 def _probe(reachable, rtt_ms=None, loss_pct=None, jitter_ms=None):
     return ProbeResult(
-        interface_name="eth0", target="8.8.8.8", target_type="public",
+        interface_name="eth0", target="8.8.8.8", target_kind="icmp", target_id="icmp:8.8.8.8",
         timestamp=0.0, rtt_ms=rtt_ms, loss_pct=loss_pct, jitter_ms=jitter_ms,
         reachable=reachable,
     )

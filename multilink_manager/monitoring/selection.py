@@ -96,6 +96,36 @@ def filter_connections_for_display(
     ]
 
 
+def visible_interfaces_for_default_view(
+    interfaces: Iterable[InterfaceInfo], enabled_map: Dict[str, bool]
+) -> List[InterfaceInfo]:
+    """Pure helper for the Interfaces tab's default ("Show all adapters"
+    OFF) view: hide a *disabled* Other/Unknown interface (virtual/VPN/
+    loopback-style adapters typically end up here), while keeping every
+    other interface visible.
+
+    An interface remains visible in this default view when EITHER:
+
+    - it is currently enabled (any classification -- including an
+      Other/Unknown interface the user has explicitly enabled, which must
+      stay visible so they can toggle it back off), OR
+    - it is classified Ethernet or Wi-Fi, even if currently disabled (so
+      a physical NIC that simply isn't plugged in / is momentarily
+      deselected remains discoverable and re-enable-able without needing
+      "Show all adapters").
+
+    A *disabled* Other/Unknown interface is the only case hidden by this
+    predicate. Toggling "Show all adapters" ON bypasses this filter
+    entirely and lists every interface, matching the full
+    ``enabled_map``-driven checkbox behaviour that existed before this
+    default-hide behaviour was added.
+    """
+    return [
+        iface for iface in interfaces
+        if enabled_map.get(iface.name, False) or iface.if_type in (InterfaceType.ETHERNET, InterfaceType.WIFI)
+    ]
+
+
 class InterfaceSelectionManager:
     """Thread-safe holder of explicit per-interface enable/disable
     overrides, keyed by interface name.

@@ -16,6 +16,7 @@ from typing import Dict, List, Optional
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDoubleSpinBox,
     QFileDialog,
     QGridLayout,
@@ -39,8 +40,12 @@ from PySide6.QtWidgets import (
 )
 
 from multilink_manager.gui.charts import TimeSeriesChart
+from multilink_manager.gui.theme import APP_VERSION, DARK_STYLESHEET
 from multilink_manager.gui.worker import MonitorWorker, Snapshot
-from multilink_manager.monitoring.selection import InterfaceSelectionManager
+from multilink_manager.monitoring.selection import (
+    InterfaceSelectionManager,
+    visible_interfaces_for_default_view,
+)
 from multilink_manager.models.steering import (
     DEFAULT_HOLD_DOWN_SECONDS,
     DEFAULT_MIN_CONSECUTIVE_CYCLES,
@@ -49,8 +54,11 @@ from multilink_manager.models.steering import (
     SteeringStatus,
 )
 from multilink_manager.networking.probing import (
+    DEFAULT_HTTPS_TARGETS,
+    DEFAULT_ICMP_TARGETS,
     DEFAULT_PROBE_INTERVAL_S,
-    DEFAULT_PUBLIC_TARGET,
+    parse_https_targets,
+    parse_icmp_targets,
 )
 from multilink_manager.storage.history_store import DEFAULT_RETENTION_MINUTES, HistoryStore
 from multilink_manager.utils.logging_config import get_logger
@@ -128,12 +136,19 @@ class MainWindow(QMainWindow):
         self,
         initial_interval_s: float = DEFAULT_INTERVAL_S,
         initial_retention_minutes: float = DEFAULT_RETENTION_MINUTES,
-        initial_public_target: str = DEFAULT_PUBLIC_TARGET,
+        initial_icmp_targets_text: Optional[str] = None,
+        initial_https_targets_text: Optional[str] = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("MultiLink Manager - Monitoring + Opt-in Failover")
-        self.resize(1280, 860)
+        self.setWindowTitle(f"MultiLink Manager v{APP_VERSION} - Monitoring + Opt-in Failover")
+        self.setStyleSheet(DARK_STYLESHEET)
+        self.resize(1360, 900)
+
+        if initial_icmp_targets_text is None:
+            initial_icmp_targets_text = ", ".join(DEFAULT_ICMP_TARGETS)
+        if initial_https_targets_text is None:
+            initial_https_targets_text = ", ".join(DEFAULT_HTTPS_TARGETS)
 
         self.history_store = HistoryStore(retention_minutes=initial_retention_minutes)
         self.worker: Optional[MonitorWorker] = None
@@ -144,17 +159,24 @@ class MainWindow(QMainWindow):
         # at construction time (see start_monitoring).
         self._selection = InterfaceSelectionManager()
 
-        self._build_ui(initial_interval_s, initial_retention_minutes, initial_public_target)
+        self._build_ui(
+            initial_interval_s, initial_retention_minutes,
+            initial_icmp_targets_text, initial_https_targets_text,
+        )
 
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
-    def _build_ui(self, initial_interval_s, initial_retention_minutes, initial_public_target) -> None:
+    def _build_ui(
+        self, initial_interval_s, initial_retention_minutes,
+        initial_icmp_targets_text, initial_https_targets_text,
+    ) -> None:
         central = QWidget(self)
         root_layout = QVBoxLayout(central)
 
         root_layout.addWidget(self._build_control_bar(
-            initial_interval_s, initial_retention_minutes, initial_public_target
+            initial_interval_s, initial_retention_minutes,
+            initial_icmp_targets_text, initial_https_targets_text,
         ))
 
         self.tabs = QTabWidget(self)
@@ -170,12 +192,17 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central)
 
-    def _build_control_bar(self, initial_interval_s, initial_retention_minutes, initial_public_target) -> QWidget:
+    def _build_control_bar(
+        self, initial_interval_s, initial_retention_minutes,
+        initial_icmp_targets_text, initial_https_targets_text,
+    ) -> QWidget:
         box = QGroupBox("Monitoring controls")
         layout = QHBoxLayout(box)
 
         self.start_btn = QPushButton("Start")
+        self.start_btn.setObjectName("startButton")
         self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setObjectName("stopButton")
         self.stop_btn.setEnabled(False)
         self.start_btn.clicked.connect(self.start_monitoring)
         self.stop_btn.clicked.connect(self.stop_monitoring)
@@ -197,11 +224,17 @@ class MainWindow(QMainWindow):
         self.retention_spin.valueChanged.connect(self._on_retention_changed)
         layout.addWidget(self.retention_spin)
 
-        layout.addWidget(QLabel("Public probe target:"))
-        self.public_target_edit = QLineEdit(initial_public_target)
-        self.public_target_edit.setPlaceholderText("e.g. 1.1.1.1 (required, gateway probing is automatic)")
-        self.public_target_edit.setMinimumWidth(160)
-        layout.addWidget(self.public_target_edit)
+        layout.addWidget(QLabel("ICMP targets:"))
+        self.icmp_targets_edit = QLineEdit(initial_icmp_targets_text)
+        self.icmp_targets_edit.setPlaceholderText("comma-separated IPv4, e.g. 1.1.1.1, 8.8.8.8 (required, gateway is automatic)")
+        self.icmp_targets_edit.setMinimumWidth(190)
+        layout.addWidget(self.icmp_targets_edit)
+
+        layout.addWidget(QLabel("HTTPS targets:"))
+        self.https_targets_edit = QLineEdit(initial_https_targets_text)
+        self.https_targets_edit.setPlaceholderText("comma-separated URLs, e.g. https://www.gstatic.com/generate_204 (optional)")
+        self.https_targets_edit.setMinimumWidth(220)
+        layout.addWidget(self.https_targets_edit)
 
         self.clear_btn = QPushButton("Clear History")
         self.clear_btn.clicked.connect(self._on_clear_history)
@@ -217,6 +250,23 @@ class MainWindow(QMainWindow):
     def _build_dashboard_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
+
+        summary_box = QGroupBox("Summary")
+        summary_layout = QHBoxLayout(summary_box)
+        self.summary_heading_label = QLabel("MultiLink Manager")
+        self.summary_heading_label.setProperty("role", "heading")
+        summary_layout.addWidget(self.summary_heading_label)
+        self.summary_interfaces_label = QLabel("Interfaces enabled: --")
+        self.summary_interfaces_label.setProperty("role", "subheading")
+        summary_layout.addWidget(self.summary_interfaces_label)
+        self.summary_best_score_label = QLabel("Best aggregate score: --")
+        self.summary_best_score_label.setProperty("role", "subheading")
+        summary_layout.addWidget(self.summary_best_score_label)
+        self.summary_steering_label = QLabel("Steering: OFF")
+        self.summary_steering_label.setProperty("role", "subheading")
+        summary_layout.addWidget(self.summary_steering_label)
+        summary_layout.addStretch(1)
+        layout.addWidget(summary_box)
 
         path_box = QGroupBox("Current path (observed preferred/default IPv4 route -- never switched by this app)")
         path_layout = QVBoxLayout(path_box)
@@ -235,13 +285,14 @@ class MainWindow(QMainWindow):
         layout.addWidget(dist_box)
 
         health_box = QGroupBox(
-            "Link health (per-interface, per-target: gateway + public probe endpoint; "
-            "primary = public-preferred with gateway fallback, used for history/score)"
+            "Link health (per-interface, per-target: gateway + each ICMP/HTTPS target + aggregate; "
+            "\"primary\" row used for history/score = Internet aggregate, gateway fallback only if no "
+            "Internet probe result exists)"
         )
         health_layout = QVBoxLayout(health_box)
-        self.link_health_table = QTableWidget(0, 8)
+        self.link_health_table = QTableWidget(0, 9)
         self.link_health_table.setHorizontalHeaderLabels(
-            ["Interface", "Target", "Address", "Reachable", "RTT (ms)", "Loss (%)", "Jitter (ms)", "Score"]
+            ["Interface", "Kind", "Endpoint", "Reachable", "Latency (ms)", "Loss (%)", "Jitter (ms)", "HTTP Status", "Score"]
         )
         self.link_health_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.link_health_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -327,6 +378,16 @@ class MainWindow(QMainWindow):
         btn_layout.addWidget(self.select_physical_defaults_btn)
         btn_layout.addWidget(self.deselect_all_btn)
         btn_layout.addStretch(1)
+        self.show_all_adapters_checkbox = QCheckBox("Show all adapters")
+        self.show_all_adapters_checkbox.setChecked(False)
+        self.show_all_adapters_checkbox.setToolTip(
+            "OFF (default): hide disabled Other/Unknown/virtual/VPN/loopback adapters "
+            "from this table (they remain monitored-eligible if you enable them while "
+            "ON, and any adapter you have manually enabled stays visible even when OFF). "
+            "ON: show every discovered adapter with its Enabled checkbox."
+        )
+        self.show_all_adapters_checkbox.toggled.connect(self._on_show_all_adapters_toggled)
+        btn_layout.addWidget(self.show_all_adapters_checkbox)
         layout.addLayout(btn_layout)
 
         self.interfaces_table = QTableWidget(0, 13)
@@ -469,12 +530,17 @@ class MainWindow(QMainWindow):
         if self.worker is not None and self.worker.isRunning():
             return
 
-        public_target = self.public_target_edit.text().strip()
-        if not public_target:
-            QMessageBox.warning(
-                self, "Public probe target required",
-                "Please enter a public probe target (e.g. 1.1.1.1 or 8.8.8.8) before starting.",
-            )
+        icmp_text = self.icmp_targets_edit.text().strip()
+        https_text = self.https_targets_edit.text().strip()
+        try:
+            icmp_targets = parse_icmp_targets(icmp_text)
+        except ValueError as exc:
+            QMessageBox.warning(self, "ICMP targets invalid", str(exc))
+            return
+        try:
+            https_targets = parse_https_targets(https_text)
+        except ValueError as exc:
+            QMessageBox.warning(self, "HTTPS targets invalid", str(exc))
             return
 
         self.history_store.set_retention_minutes(self.retention_spin.value())
@@ -483,7 +549,8 @@ class MainWindow(QMainWindow):
             history_store=self.history_store,
             interval_s=self.interval_spin.value(),
             probe_interval_s=DEFAULT_PROBE_INTERVAL_S,
-            public_target=public_target,
+            icmp_targets=icmp_targets,
+            https_targets=https_targets,
             selection_manager=self._selection,
         )
         self.worker.snapshot_ready.connect(self._on_snapshot)
@@ -492,9 +559,16 @@ class MainWindow(QMainWindow):
 
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        self.public_target_edit.setEnabled(False)
-        self.status_label.setText(f"Running (public target: {public_target}).")
-        logger.info("Monitoring started from GUI (public_target=%s)", public_target)
+        self.icmp_targets_edit.setEnabled(False)
+        self.https_targets_edit.setEnabled(False)
+        self.status_label.setText(
+            f"Running (ICMP targets: {', '.join(icmp_targets)}; "
+            f"HTTPS targets: {', '.join(https_targets) if https_targets else 'none'})."
+        )
+        logger.info(
+            "Monitoring started from GUI (icmp_targets=%s https_targets=%s)",
+            icmp_targets, https_targets,
+        )
 
     def stop_monitoring(self) -> None:
         if self.worker is None:
@@ -543,7 +617,8 @@ class MainWindow(QMainWindow):
 
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        self.public_target_edit.setEnabled(True)
+        self.icmp_targets_edit.setEnabled(True)
+        self.https_targets_edit.setEnabled(True)
         self.status_label.setText("Stopped.")
         logger.info("Monitoring stopped from GUI")
 
@@ -618,6 +693,23 @@ class MainWindow(QMainWindow):
         self._render_interfaces(snapshot)
         self._render_connections(snapshot)
         self._render_steering_status(snapshot.steering_status)
+        self._render_summary(snapshot)
+
+    def _render_summary(self, snapshot: Snapshot) -> None:
+        enabled_count = len(snapshot.enabled_interfaces)
+        self.summary_interfaces_label.setText(f"Interfaces enabled: {enabled_count}")
+
+        known_scores = [s.score for s in snapshot.scores.values() if s and s.score is not None]
+        if known_scores:
+            self.summary_best_score_label.setText(f"Best aggregate score: {max(known_scores):.1f}")
+        else:
+            self.summary_best_score_label.setText("Best aggregate score: unavailable")
+
+        steering = snapshot.steering_status
+        if steering is not None and getattr(steering, "enabled", False):
+            self.summary_steering_label.setText("Steering: ON")
+        else:
+            self.summary_steering_label.setText("Steering: OFF")
 
     def _render_current_path(self, snapshot: Snapshot) -> None:
         if snapshot.preferred_interface:
@@ -659,27 +751,34 @@ class MainWindow(QMainWindow):
         for iface in snapshot.enabled_interfaces:
             name = iface.name
             iface_probes = snapshot.probes.get(name, {})
-            primary_type = snapshot.primary_target.get(name)
-            for target_type, probe in sorted(iface_probes.items()):
-                row_score = snapshot.target_scores.get(name, {}).get(target_type)
-                label = target_type
-                if target_type == primary_type:
-                    label = f"{target_type} (primary)"
-                rows.append((name, label, probe, row_score))
+            primary_id = snapshot.primary_target.get(name)
+            for target_id, probe in sorted(iface_probes.items()):
+                row_score = snapshot.target_scores.get(name, {}).get(target_id)
+                kind_label = {
+                    "gateway": "Gateway",
+                    "icmp": "ICMP",
+                    "https": "HTTPS",
+                    "aggregate": "Internet (aggregate)",
+                }.get(probe.target_kind, probe.target_kind)
+                if target_id == primary_id:
+                    kind_label = f"{kind_label} (primary)"
+                rows.append((name, kind_label, probe, row_score))
 
         table = self.link_health_table
         table.setRowCount(len(rows))
-        for row, (name, label, probe, score) in enumerate(rows):
+        for row, (name, kind_label, probe, score) in enumerate(rows):
             table.setItem(row, 0, QTableWidgetItem(name))
-            table.setItem(row, 1, QTableWidgetItem(label))
+            table.setItem(row, 1, QTableWidgetItem(kind_label))
             table.setItem(row, 2, QTableWidgetItem(probe.target))
             reachable_text = "unknown" if probe.reachable is None else ("yes" if probe.reachable else "no")
             table.setItem(row, 3, QTableWidgetItem(reachable_text))
             table.setItem(row, 4, QTableWidgetItem(_fmt(probe.rtt_ms)))
             table.setItem(row, 5, QTableWidgetItem(_fmt(probe.loss_pct)))
             table.setItem(row, 6, QTableWidgetItem(_fmt(probe.jitter_ms)))
+            http_status_text = "n/a" if probe.http_status is None else str(probe.http_status)
+            table.setItem(row, 7, QTableWidgetItem(http_status_text))
             score_text = "unavailable" if (score is None or score.score is None) else f"{score.score:.1f}"
-            table.setItem(row, 7, QTableWidgetItem(score_text))
+            table.setItem(row, 8, QTableWidgetItem(score_text))
 
     def _render_traffic_table(self, snapshot: Snapshot) -> None:
         table = self.traffic_table
@@ -726,8 +825,8 @@ class MainWindow(QMainWindow):
 
         for iface in snapshot.enabled_interfaces:
             name = iface.name
-            primary_type = snapshot.primary_target.get(name)
-            probe = snapshot.probes.get(name, {}).get(primary_type) if primary_type else None
+            primary_id = snapshot.primary_target.get(name)
+            probe = snapshot.probes.get(name, {}).get(primary_id) if primary_id else None
             score = snapshot.scores.get(name)
             if probe is not None:
                 if probe.rtt_ms is not None:
@@ -742,6 +841,8 @@ class MainWindow(QMainWindow):
 
     def _render_interfaces_table(self, interfaces, enabled_map: Dict[str, bool]) -> None:
         table = self.interfaces_table
+        if not self.show_all_adapters_checkbox.isChecked():
+            interfaces = visible_interfaces_for_default_view(interfaces, enabled_map)
         # Block signals for the entire programmatic rebuild so setting
         # each checkbox's state below never re-enters
         # ``_on_interface_item_changed`` via ``itemChanged`` -- that signal
@@ -798,6 +899,11 @@ class MainWindow(QMainWindow):
         self._render_interfaces_table(interfaces, self._selection.resolve(interfaces))
         logger.info("All interfaces deselected from GUI")
         self.status_label.setText("All interfaces deselected (still listed; re-enable any at any time).")
+
+    def _on_show_all_adapters_toggled(self, checked: bool) -> None:
+        interfaces = self._latest_snapshot.interfaces if self._latest_snapshot else []
+        self._render_interfaces_table(interfaces, self._selection.resolve(interfaces))
+        logger.info("Interfaces tab 'Show all adapters' toggled %s", "ON" if checked else "OFF")
 
     def _render_connections(self, snapshot: Snapshot) -> None:
         table = self.connections_table

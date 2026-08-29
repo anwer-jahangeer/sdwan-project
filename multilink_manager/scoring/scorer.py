@@ -2,9 +2,11 @@
 
 Documented formula (also mirrored in README "Scoring" section)
 ------------------------------------------------------------
-Given a single ``ProbeResult`` for an interface (an aggregate probe
-covering gateway and/or public-endpoint reachability), the score is
-computed as follows:
+Given a single ``ProbeResult`` for an interface -- this can be any
+individual per-target probe (gateway/ICMP/HTTPS) shown in the Link Health
+table, or the synthetic per-interface ``target_kind="aggregate"`` result
+from ``scoring/aggregation.py`` used for the headline
+score/history/steering -- the score is computed as follows:
 
 1. If ``reachable`` is unknown (``None``) -- the probe could not be
    attempted at all -- the score is ``None`` ("unknown"), never a guessed

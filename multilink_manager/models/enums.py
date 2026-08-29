@@ -20,4 +20,6 @@ class InterfaceStatus(str, Enum):
 
 class TargetType(str, Enum):
     GATEWAY = "gateway"
-    PUBLIC = "public"
+    ICMP = "icmp"
+    HTTPS = "https"
+    AGGREGATE = "aggregate"
