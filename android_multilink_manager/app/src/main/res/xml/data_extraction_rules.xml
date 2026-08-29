@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  This app stores no user credentials, no location data, and no
+  personally identifying information. It only keeps small in-memory
+  monitoring history (cleared on process death) and a probe-URL
+  preference. Nothing sensitive to exclude from backup/restore, so the
+  default full-backup/transfer behavior is left enabled.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <include domain="sharedpref" path="." />
+    </cloud-backup>
+    <device-transfer>
+        <include domain="sharedpref" path="." />
+    </device-transfer>
+</data-extraction-rules>

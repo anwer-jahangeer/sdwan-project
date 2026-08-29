@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Base application theme, used only as the Activity's window theme
+      before Compose content is set (and for the system splash background).
+      All actual UI styling is done in Kotlin via ui/theme/Theme.kt.
+    -->
+    <style name="Theme.MultiLinkManager" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>

@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.log
+
+# Android / Gradle
+.gradle/
+.idea/
+**/build/
+local.properties
+captures/
+*.apk
+*.aab
+
+# Android signing material
+*.jks
+*.keystore
+keystore.properties
+
+# Editors / operating systems
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store

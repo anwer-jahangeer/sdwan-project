@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Enforces HTTPS-only for this app's own network security probes and any
+  other outgoing connection. Cleartext (plain HTTP) traffic is disabled
+  app-wide; probe endpoints must be https:// URLs.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+</network-security-config>

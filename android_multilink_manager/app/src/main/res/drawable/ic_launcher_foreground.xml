@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Abstract icon: three link "nodes" (Wi-Fi / cellular / hotspot) converging
+  on one central node, hinting at multi-link awareness without implying
+  actual traffic aggregation across them.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- connecting lines -->
+    <path
+        android:strokeColor="#5AC8FA"
+        android:strokeWidth="3"
+        android:strokeLineCap="round"
+        android:pathData="M54,54 L54,28 M54,54 L76.5,67 M54,54 L31.5,67" />
+    <!-- outer nodes -->
+    <path
+        android:fillColor="#5AC8FA"
+        android:pathData="M54,22 a6,6 0 1,0 0.01,0 z" />
+    <path
+        android:fillColor="#34C759"
+        android:pathData="M76.5,61 a6,6 0 1,0 0.01,0 z" />
+    <path
+        android:fillColor="#FF9F0A"
+        android:pathData="M31.5,61 a6,6 0 1,0 0.01,0 z" />
+    <!-- central node -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,45 a9,9 0 1,0 0.01,0 z" />
+</vector>

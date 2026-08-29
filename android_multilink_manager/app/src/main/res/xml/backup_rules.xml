@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Pre-Android-12 backup rules (superseded by data_extraction_rules.xml on
+     API 31+, but still referenced by fullBackupContent for older devices
+     this minSdk=26 app could theoretically be sideloaded to). Nothing
+     sensitive is stored, so no exclusions are necessary. -->
+<full-backup-content>
+</full-backup-content>
