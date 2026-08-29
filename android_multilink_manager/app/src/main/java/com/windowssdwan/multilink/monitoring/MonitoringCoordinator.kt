@@ -163,7 +163,7 @@ class MonitoringCoordinator(
         }
 
         for (linkId in currentLinkIds) {
-            if (linkId in probeJobs) continue
+            if (probeJobs.containsKey(linkId)) continue
             val network = networkMonitor.networkFor(linkId) ?: continue
             val aggregator = aggregators.getOrPut(linkId) { JitterLossAggregator(config.windowSize) }
             Logger.i(TAG, "Starting probe loop for link handle=${linkId.networkHandle}")
